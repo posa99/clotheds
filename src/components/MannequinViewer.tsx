@@ -1,5 +1,7 @@
-import React from 'react';
+import React, { useEffect, useRef, useState } from 'react';
+import * as THREE from 'three';
 import { ClothingItem, BodyConfig, ClothesCategory } from '../types';
+import { RotateCw, Move3d, Compass } from 'lucide-react';
 
 interface MannequinViewerProps {
   items: Record<ClothesCategory, ClothingItem>;
@@ -12,725 +14,1746 @@ export const MannequinViewer: React.FC<MannequinViewerProps> = ({
   body,
   activeZoom
 }) => {
-  const { skinTone, bodyScaleX, bodyScaleY } = body;
+  const containerRef = useRef<HTMLDivElement>(null);
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const sceneRef = useRef<THREE.Scene | null>(null);
+  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  
+  // Animation/Interaction state
+  const [autoRotate, setAutoRotate] = useState(true);
+  const yawRef = useRef<number>(0);
+  const pitchRef = useRef<number>(0.1); // Slightly tilted downwards for 3D depth
+  const isDraggingRef = useRef<boolean>(false);
+  const originalMouseRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+  const startRotationRef = useRef<{ yaw: number; pitch: number }>({ yaw: 0, pitch: 0.1 });
+  const lastInteractTime = useRef<number>(0);
 
-  // Zooming class or transform
-  const getZoomStyle = () => {
-    switch (activeZoom) {
-      case 'head':
-        return { transform: 'scale(1.9) translateY(45px)', transformOrigin: 'center top' };
-      case 'torso':
-        return { transform: 'scale(1.4) translateY(-10px)', transformOrigin: 'center center' };
-      case 'feet':
-        return { transform: 'scale(2) translateY(-145px)', transformOrigin: 'center bottom' };
-      default:
-        return { transform: 'scale(1) translateY(0px)', transformOrigin: 'center' };
-    }
-  };
+  // Group hosting the rotated model
+  const rotationGroupRef = useRef<THREE.Group | null>(null);
+  // Group hosting actual geometry meshes (rebuilds dynamically)
+  const modelGroupRef = useRef<THREE.Group | null>(null);
 
-  // Preset Skin Tones Hex
-  const getSkinToneHex = (tone: string) => {
+  const [sceneReady, setSceneReady] = useState(false);
+  const activeZoomRef = useRef(activeZoom);
+  const autoRotateRef = useRef(autoRotate);
+
+  useEffect(() => {
+    activeZoomRef.current = activeZoom;
+  }, [activeZoom]);
+
+  useEffect(() => {
+    autoRotateRef.current = autoRotate;
+  }, [autoRotate]);
+
+  // PRESET SKIN TONES HEX mapped to nice 3D materials
+  const getSkinToneColor = (tone: string) => {
     switch (tone) {
       case 'porcelain': return '#FFF0E5';
       case 'sand': return '#F3D2C1';
       case 'caramel': return '#C58F71';
       case 'cocoa': return '#8D5B4C';
       case 'obsidian': return '#452A22';
-      // Fun colors
-      case 'emerald': return '#A7F3D0';
-      case 'violet': return '#DDD6FE';
-      case 'silver': return '#E2E8F0';
+      case 'emerald': return '#6EE7B7';
+      case 'violet': return '#C4B5FD';
+      case 'silver': return '#CBD5E1';
       default: return tone;
     }
   };
 
-  const skinColor = getSkinToneHex(skinTone);
-  const shadowSkinColor = adjustColorBrightness(skinColor, -25);
-  const blushColor = adjustColorBrightness(skinColor, -15);
+  // Helper: Generates beautiful procedural repeating canvas textures for pattern support in 3D!
+  const createPatternTexture = (
+    patternType: 'solid' | 'stripes-h' | 'stripes-v' | 'dots' | 'checkerboard' | 'stars',
+    colors: { primary: string; secondary: string; accent: string },
+    opacity: number
+  ): THREE.Texture => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 256;
+    canvas.height = 256;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return new THREE.Texture();
 
-  // Helper to adjust color for shadows
-  function adjustColorBrightness(hex: string, percent: number) {
-    let R = parseInt(hex.substring(1, 3), 16);
-    let G = parseInt(hex.substring(3, 5), 16);
-    let B = parseInt(hex.substring(5, 7), 16);
+    // Background base
+    ctx.fillStyle = colors.primary;
+    ctx.fillRect(0, 0, 256, 256);
 
-    R = parseInt((R * (100 + percent)) / 100 as any);
-    G = parseInt((G * (100 + percent)) / 100 as any);
-    B = parseInt((B * (100 + percent)) / 100 as any);
+    if (patternType === 'solid') {
+      const texture = new THREE.CanvasTexture(canvas);
+      return texture;
+    }
 
-    R = (R < 255) ? R : 255;
-    G = (G < 255) ? G : 255;
-    B = (B < 255) ? B : 255;
+    // Secondary layer config
+    ctx.fillStyle = colors.secondary;
+    ctx.strokeStyle = colors.secondary;
+    ctx.globalAlpha = opacity;
 
-    R = (R > 0) ? R : 0;
-    G = (G > 0) ? G : 0;
-    B = (B > 0) ? B : 0;
+    if (patternType === 'stripes-h') {
+      ctx.lineWidth = 14;
+      for (let y = 0; y < 256; y += 32) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(256, y);
+        ctx.stroke();
+      }
+    } else if (patternType === 'stripes-v') {
+      ctx.lineWidth = 14;
+      for (let x = 0; x < 256; x += 32) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, 256);
+        ctx.stroke();
+      }
+    } else if (patternType === 'dots') {
+      const spacing = 32;
+      for (let y = spacing / 2; y < 256; y += spacing) {
+        for (let x = spacing / 2; x < 256; x += spacing) {
+          ctx.beginPath();
+          ctx.arc(x, y, 5, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+    } else if (patternType === 'checkerboard') {
+      const size = 32;
+      for (let y = 0; y < 256; y += size * 2) {
+        for (let x = 0; x < 256; x += size * 2) {
+          ctx.fillRect(x, y, size, size);
+          ctx.fillRect(x + size, y + size, size, size);
+        }
+      }
+    } else if (patternType === 'stars') {
+      const drawStar = (cx: number, cy: number, spikes: number, outerRadius: number, innerRadius: number) => {
+        let rot = (Math.PI / 2) * 3;
+        let x = cx;
+        let y = cy;
+        const step = Math.PI / spikes;
 
-    const rHex = R.toString(16).padStart(2, '0');
-    const gHex = G.toString(16).padStart(2, '0');
-    const bHex = B.toString(16).padStart(2, '0');
+        ctx.beginPath();
+        ctx.moveTo(cx, cy - outerRadius);
+        for (let i = 0; i < spikes; i++) {
+          x = cx + Math.cos(rot) * outerRadius;
+          y = cy + Math.sin(rot) * outerRadius;
+          ctx.lineTo(x, y);
+          rot += step;
 
-    return `#${rHex}${gHex}${bHex}`;
-  }
+          x = cx + Math.cos(rot) * innerRadius;
+          y = cy + Math.sin(rot) * innerRadius;
+          ctx.lineTo(x, y);
+          rot += step;
+        }
+        ctx.lineTo(cx, cy - outerRadius);
+        ctx.closePath();
+        ctx.fill();
+      };
 
-  // Pattern overlays
-  const renderPatternMask = (item: ClothingItem, shapeId: string) => {
-    if (!item.visible || item.pattern.type === 'solid') return null;
-    return (
-      <path
-        d={shapeId}
-        fill={`url(#pat-${item.pattern.type})`}
-        style={{ opacity: item.pattern.opacity }}
-        pointerEvents="none"
-      />
+      const spacing = 64;
+      for (let y = spacing / 2; y < 256; y += spacing) {
+        for (let x = spacing / 2; x < 256; x += spacing) {
+          drawStar(x, y, 5, 8, 4);
+        }
+      }
+    }
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.wrapS = THREE.RepeatWrapping;
+    texture.wrapT = THREE.RepeatWrapping;
+    texture.repeat.set(2, 2);
+    return texture;
+  };
+
+  // Setup basic WebGL Three.js viewport
+  useEffect(() => {
+    if (!containerRef.current) return;
+
+    // Create scene with fog for nice production presentation edge
+    const scene = new THREE.Scene();
+    scene.background = null; // transparent to use CSS backdrop gradient
+    sceneRef.current = scene;
+
+    // Camera setup
+    const camera = new THREE.PerspectiveCamera(
+      35,
+      containerRef.current.clientWidth / containerRef.current.clientHeight,
+      0.1,
+      100
     );
+    camera.position.set(0, 0.4, 4.8);
+    cameraRef.current = camera;
+
+    // WebGL Renderer
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(containerRef.current.clientWidth, containerRef.current.clientHeight);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+    // Wipe any stale canvas
+    containerRef.current.innerHTML = '';
+    containerRef.current.appendChild(renderer.domElement);
+    rendererRef.current = renderer;
+
+    // Lighting setup
+    const ambientLight = new THREE.AmbientLight(0xfff7ed, 0.85); // elegant warm tint
+    scene.add(ambientLight);
+
+    // Warm Directional Sunlight
+    const dirLight = new THREE.DirectionalLight(0xfff8ee, 1.4);
+    dirLight.position.set(4, 8, 5);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.width = 1024;
+    dirLight.shadow.mapSize.height = 1024;
+    dirLight.shadow.bias = -0.001;
+    scene.add(dirLight);
+
+    // Cool Counter Rim Light from back
+    const rimLight = new THREE.DirectionalLight(0xe0f2fe, 0.85);
+    rimLight.position.set(-4, 0.5, -5);
+    scene.add(rimLight);
+
+    // Floor Platform with soft grid marker
+    const floorGeo = new THREE.CylinderGeometry(1.2, 1.25, 0.1, 32);
+    const floorMat = new THREE.MeshStandardMaterial({
+      color: 0x0f172a, // elegant dark anchor slate
+      roughness: 0.6,
+      metalness: 0.1,
+    });
+    const floor = new THREE.Mesh(floorGeo, floorMat);
+    floor.position.y = -1.18;
+    floor.receiveShadow = true;
+    scene.add(floor);
+
+    // Subtle Grid on Floor for modeling depth
+    const gridObj = new THREE.GridHelper(2.5, 10, 0x334155, 0x1e293b);
+    gridObj.position.y = -1.13;
+    scene.add(gridObj);
+
+    // Dynamic rotation nodes
+    const rotationGroup = new THREE.Group();
+    scene.add(rotationGroup);
+    rotationGroupRef.current = rotationGroup;
+
+    const modelGroup = new THREE.Group();
+    rotationGroup.add(modelGroup);
+    modelGroupRef.current = modelGroup;
+
+    // Frame resize support
+    const handleResize = () => {
+      if (!containerRef.current || !rendererRef.current || !cameraRef.current) return;
+      const w = containerRef.current.clientWidth;
+      const h = containerRef.current.clientHeight;
+      cameraRef.current.aspect = w / h;
+      cameraRef.current.updateProjectionMatrix();
+      rendererRef.current.setSize(w, h);
+    };
+
+    const resizeObserver = new ResizeObserver(() => {
+      handleResize();
+    });
+    resizeObserver.observe(containerRef.current);
+
+    // Drag-to-rotate event listeners
+    const onMouseDown = (e: MouseEvent) => {
+      isDraggingRef.current = true;
+      originalMouseRef.current = { x: e.clientX, y: e.clientY };
+      startRotationRef.current = { yaw: yawRef.current, pitch: pitchRef.current };
+      lastInteractTime.current = Date.now();
+    };
+
+    const onMouseMove = (e: MouseEvent) => {
+      if (!isDraggingRef.current) return;
+      const deltaX = e.clientX - originalMouseRef.current.x;
+      const deltaY = e.clientY - originalMouseRef.current.y;
+      
+      // Update Rotations
+      yawRef.current = startRotationRef.current.yaw + deltaX * 0.0075;
+      pitchRef.current = Math.max(-0.4, Math.min(0.6, startRotationRef.current.pitch + deltaY * 0.005));
+      lastInteractTime.current = Date.now();
+    };
+
+    const onMouseUp = () => {
+      isDraggingRef.current = false;
+    };
+
+    // Touch support for mobile layouts
+    const onTouchStart = (e: TouchEvent) => {
+      if (e.touches.length === 0) return;
+      isDraggingRef.current = true;
+      originalMouseRef.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+      startRotationRef.current = { yaw: yawRef.current, pitch: pitchRef.current };
+      lastInteractTime.current = Date.now();
+    };
+
+    const onTouchMove = (e: TouchEvent) => {
+      if (!isDraggingRef.current || e.touches.length === 0) return;
+      const deltaX = e.touches[0].clientX - originalMouseRef.current.x;
+      const deltaY = e.touches[0].clientY - originalMouseRef.current.y;
+      
+      yawRef.current = startRotationRef.current.yaw + deltaX * 0.009;
+      pitchRef.current = Math.max(-0.4, Math.min(0.6, startRotationRef.current.pitch + deltaY * 0.006));
+      lastInteractTime.current = Date.now();
+    };
+
+    const dom = renderer.domElement;
+    dom.style.cursor = 'grab';
+    dom.addEventListener('mousedown', onMouseDown);
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+    
+    dom.addEventListener('touchstart', onTouchStart, { passive: true });
+    dom.addEventListener('touchmove', onTouchMove, { passive: true });
+    dom.addEventListener('touchend', onMouseUp);
+
+    // Kinetic Animation loop
+    let animeId: number;
+    let cameraTargetY = 0.4;
+    let cameraTargetZ = 4.8;
+
+    const animate = () => {
+      animeId = requestAnimationFrame(animate);
+
+      // Smooth camera updates based on active zoom levels
+      let desiredY = 0.4;
+      let desiredZ = 4.8;
+
+      if (activeZoomRef.current === 'head') {
+        desiredY = 1.05;
+        desiredZ = 1.6;
+      } else if (activeZoomRef.current === 'torso') {
+        desiredY = 0.45;
+        desiredZ = 2.4;
+      } else if (activeZoomRef.current === 'feet') {
+        desiredY = -0.7;
+        desiredZ = 1.8;
+      }
+
+      // Smooth damp
+      cameraTargetY += (desiredY - cameraTargetY) * 0.08;
+      cameraTargetZ += (desiredZ - cameraTargetZ) * 0.08;
+
+      camera.position.y = cameraTargetY;
+      camera.position.z = cameraTargetZ;
+      camera.lookAt(0, cameraTargetY - (activeZoomRef.current === 'feet' ? 0.1 : 0.05), 0);
+
+      // Slower rotation backup when user is idle
+      const now = Date.now();
+      if (autoRotateRef.current && !isDraggingRef.current && (now - lastInteractTime.current > 3000)) {
+        yawRef.current += 0.004; // steady gentle rotation
+      }
+
+      // Apply coordinates safely
+      if (rotationGroup) {
+        rotationGroup.rotation.y = yawRef.current;
+        rotationGroup.rotation.x = pitchRef.current;
+      }
+
+      renderer.render(scene, camera);
+    };
+    animate();
+    setSceneReady(true);
+
+    // Deep resource cleanup
+    return () => {
+      setSceneReady(false);
+      cancelAnimationFrame(animeId);
+      resizeObserver.disconnect();
+      dom.removeEventListener('mousedown', onMouseDown);
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+      dom.removeEventListener('touchstart', onTouchStart);
+      dom.removeEventListener('touchmove', onTouchMove);
+      dom.removeEventListener('touchend', onMouseUp);
+      
+      floorGeo.dispose();
+      floorMat.dispose();
+      renderer.dispose();
+    };
+  }, []);
+
+  // Main React effect listening to physique & clothe updates to reconstruct meshes in real-time
+  useEffect(() => {
+    const scene = sceneRef.current;
+    const modelGroup = modelGroupRef.current;
+    if (!scene || !modelGroup) return;
+
+    // Clear everything from old group
+    while (modelGroup.children.length > 0) {
+      const child = modelGroup.children[0];
+      modelGroup.remove(child);
+      
+      // Memory cleanup for geometries and materials
+      if (child instanceof THREE.Mesh) {
+        if (child.geometry) child.geometry.dispose();
+        if (Array.isArray(child.material)) {
+          child.material.forEach((m) => {
+            if (m.map) m.map.dispose();
+            m.dispose();
+          });
+        } else if (child.material) {
+          if (child.material.map) child.material.map.dispose();
+          child.material.dispose();
+        }
+      }
+    }
+
+    // Capture dynamic physique configs
+    const scaleX = body.bodyScaleX;
+    const scaleY = body.bodyScaleY;
+
+    // Dynamic Skin Material
+    const skinHex = getSkinToneColor(body.skinTone);
+    const skinMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(skinHex),
+      roughness: 0.42,
+      metalness: 0.02
+    });
+
+    // Materials helpers for garments
+    const makeClotheMat = (item: ClothingItem) => {
+      const colors = item.color;
+      const texture = createPatternTexture(item.pattern.type, colors, item.pattern.opacity);
+      
+      return new THREE.MeshStandardMaterial({
+        color: new THREE.Color(colors.primary),
+        map: item.pattern.type !== 'solid' ? texture : null,
+        roughness: 0.65,
+        metalness: 0.08,
+      });
+    };
+
+    const makeAccentMat = (item: ClothingItem) => {
+      return new THREE.MeshStandardMaterial({
+        color: new THREE.Color(item.color.secondary),
+        roughness: 0.55,
+        metalness: 0.12
+      });
+    };
+
+    const makePipingMat = (item: ClothingItem) => {
+      return new THREE.MeshStandardMaterial({
+        color: new THREE.Color(item.color.accent),
+        roughness: 0.4,
+        metalness: 0.2
+      });
+    };
+
+    // ==========================================
+    // 1. ANATOMICAL SKELETAL BASE (PERFECTLY ALIGNED)
+    // ==========================================
+    
+    // Core head ball
+    const headGeo = new THREE.SphereGeometry(0.183, 64, 48);
+    const head = new THREE.Mesh(headGeo, skinMat);
+    // Align head vertically relative to dynamic Y physique
+    const headY = 1.05 * scaleY;
+    head.position.set(0, headY, 0);
+    head.scale.set(scaleX, 1, scaleX);
+    head.castShadow = true;
+    head.receiveShadow = true;
+    modelGroup.add(head);
+
+    // Cute Anime Face Detailing (Slight black cylinders for eyelash arches, small spheres for blush)
+    const eyeGeo = new THREE.CylinderGeometry(0.012, 0.012, 0.04, 32);
+    // Left Eyelash
+    const eyeL = new THREE.Mesh(eyeGeo, new THREE.MeshBasicMaterial({ color: 0x1e293b }));
+    eyeL.rotation.z = Math.PI / 2;
+    eyeL.rotation.y = 0.2;
+    eyeL.position.set(-0.048 * scaleX, headY - 0.015 * scaleY, 0.150 * scaleX);
+    modelGroup.add(eyeL);
+
+    // Right Eyelash
+    const eyeR = new THREE.Mesh(eyeGeo, new THREE.MeshBasicMaterial({ color: 0x1e293b }));
+    eyeR.rotation.z = Math.PI / 2;
+    eyeR.rotation.y = -0.2;
+    eyeR.position.set(0.048 * scaleX, headY - 0.015 * scaleY, 0.150 * scaleX);
+    modelGroup.add(eyeR);
+
+    // Rosy Blush Cheek Spheres
+    const blushGeo = new THREE.SphereGeometry(0.018, 32, 32);
+    const blushMat = new THREE.MeshBasicMaterial({ color: 0xfca5a5, transparent: true, opacity: 0.5 });
+    
+    const blushL = new THREE.Mesh(blushGeo, blushMat);
+    blushL.position.set(-0.08 * scaleX, headY - 0.05 * scaleY, 0.141 * scaleX);
+    modelGroup.add(blushL);
+
+    const blushR = new THREE.Mesh(blushGeo, blushMat);
+    blushR.position.set(0.08 * scaleX, headY - 0.05 * scaleY, 0.141 * scaleX);
+    modelGroup.add(blushR);
+
+    // Symmetrical Ears
+    const earGeo = new THREE.SphereGeometry(0.028 * scaleX, 32, 32);
+    const earL = new THREE.Mesh(earGeo, skinMat);
+    earL.position.set(-0.177 * scaleX, headY, 0);
+    earL.castShadow = true;
+    earL.receiveShadow = true;
+    modelGroup.add(earL);
+
+    const earR = new THREE.Mesh(earGeo, skinMat);
+    earR.position.set(0.177 * scaleX, headY, 0);
+    earR.castShadow = true;
+    earR.receiveShadow = true;
+    modelGroup.add(earR);
+
+    // Neck Column
+    const neckHeight = 0.18 * scaleY;
+    const neckGeo = new THREE.CylinderGeometry(0.05 * scaleX, 0.058 * scaleX, neckHeight, 64);
+    const neck = new THREE.Mesh(neckGeo, skinMat);
+    const neckY = headY - 0.18 * scaleY;
+    neck.position.set(0, neckY, 0);
+    neck.castShadow = true;
+    neck.receiveShadow = true;
+    modelGroup.add(neck);
+
+    // Symmetrical Collar Bones (visualized via slim capsule bar)
+    const collarbarGeo = new THREE.CylinderGeometry(0.010, 0.010, 0.38 * scaleX, 32);
+    const collarbar = new THREE.Mesh(collarbarGeo, new THREE.MeshStandardMaterial({ color: skinHex, roughness: 0.7 }));
+    collarbar.rotation.z = Math.PI / 2;
+    collarbar.position.set(0, neckY - neckHeight/2, 0.05 * scaleX);
+    modelGroup.add(collarbar);
+
+    // Upper Chest/Torso Container
+    const chestHeight = 0.52 * scaleY;
+    const chestGeo = new THREE.CylinderGeometry(0.21 * scaleX, 0.17 * scaleX, chestHeight, 64);
+    const chest = new THREE.Mesh(chestGeo, skinMat);
+    const chestY = neckY - neckHeight/2 - chestHeight/2;
+    chest.position.set(0, chestY, 0);
+    chest.castShadow = true;
+    chest.receiveShadow = true;
+    modelGroup.add(chest);
+
+    // Pelvis / Waist hip base
+    const pelvisHeight = 0.3 * scaleY;
+    const pelvisGeo = new THREE.CylinderGeometry(0.17 * scaleX, 0.2 * scaleX, pelvisHeight, 64);
+    const pelvis = new THREE.Mesh(pelvisGeo, skinMat);
+    const pelvisY = chestY - chestHeight/2 - pelvisHeight/2;
+    pelvis.position.set(0, pelvisY, 0);
+    pelvis.castShadow = true;
+    pelvis.receiveShadow = true;
+    modelGroup.add(pelvis);
+
+    // Absolute alignment positions for limbs (Guarantees identical left and right sides!)
+    const legXOffset = 0.12 * scaleX; // Equal spacing from alignment center
+    const upperLegLength = 0.52 * scaleY;
+    const lowerLegLength = 0.52 * scaleY;
+    const kneeY = pelvisY - pelvisHeight/2 - upperLegLength/2;
+    const ankleY = kneeY - lowerLegLength;
+    const actualKneeY = pelvisY - pelvisHeight/2 - upperLegLength;
+    const actualAnkleY = ankleY - lowerLegLength / 2;
+
+    // Symmetrical LEGS & KNEES (Addressing identical scaling & straightness)
+    // Left Leg Upper
+    const legUpperLGeo = new THREE.CylinderGeometry(0.082 * scaleX, 0.072 * scaleX, upperLegLength, 64);
+    const legUpperL = new THREE.Mesh(legUpperLGeo, skinMat);
+    legUpperL.position.set(-legXOffset, pelvisY - pelvisHeight/2 - upperLegLength/2, 0);
+    legUpperL.castShadow = true;
+    legUpperL.receiveShadow = true;
+    modelGroup.add(legUpperL);
+
+    // Right Leg Upper (Mirroring Left Upper perfectly)
+    const legUpperRGeo = new THREE.CylinderGeometry(0.082 * scaleX, 0.072 * scaleX, upperLegLength, 64);
+    const legUpperR = new THREE.Mesh(legUpperRGeo, skinMat);
+    legUpperR.position.set(legXOffset, pelvisY - pelvisHeight/2 - upperLegLength/2, 0);
+    legUpperR.castShadow = true;
+    legUpperR.receiveShadow = true;
+    modelGroup.add(legUpperR);
+
+    // Left Leg Lower
+    const legLowerLGeo = new THREE.CylinderGeometry(0.068 * scaleX, 0.055 * scaleX, lowerLegLength, 64);
+    const legLowerL = new THREE.Mesh(legLowerLGeo, skinMat);
+    legLowerL.position.set(-legXOffset, ankleY, 0);
+    legLowerL.castShadow = true;
+    legLowerL.receiveShadow = true;
+    modelGroup.add(legLowerL);
+
+    // Right Leg Lower (Mirroring Left Lower perfectly)
+    const legLowerRGeo = new THREE.CylinderGeometry(0.068 * scaleX, 0.055 * scaleX, lowerLegLength, 64);
+    const legLowerR = new THREE.Mesh(legLowerRGeo, skinMat);
+    legLowerR.position.set(legXOffset, ankleY, 0);
+    legLowerR.castShadow = true;
+    legLowerR.receiveShadow = true;
+    modelGroup.add(legLowerR);
+
+    // Joint Spheres (Knees - perfectly aligned at anatomical thigh-calf transition)
+    const jointGeo = new THREE.SphereGeometry(0.072 * scaleX, 32, 32);
+    
+    const kneeL = new THREE.Mesh(jointGeo, skinMat);
+    kneeL.position.set(-legXOffset, actualKneeY, 0.005);
+    kneeL.castShadow = true;
+    kneeL.receiveShadow = true;
+    modelGroup.add(kneeL);
+
+    const kneeR = new THREE.Mesh(jointGeo, skinMat);
+    kneeR.position.set(legXOffset, actualKneeY, 0.005);
+    kneeR.castShadow = true;
+    kneeR.receiveShadow = true;
+    modelGroup.add(kneeR);
+
+    // Symmetrical Ankle Joint Spheres
+    const ankleJointGeo = new THREE.SphereGeometry(0.055 * scaleX, 32, 32);
+    
+    const ankleL = new THREE.Mesh(ankleJointGeo, skinMat);
+    ankleL.position.set(-legXOffset, actualAnkleY, 0);
+    ankleL.castShadow = true;
+    ankleL.receiveShadow = true;
+    modelGroup.add(ankleL);
+
+    const ankleR = new THREE.Mesh(ankleJointGeo, skinMat);
+    ankleR.position.set(legXOffset, actualAnkleY, 0);
+    ankleR.castShadow = true;
+    ankleR.receiveShadow = true;
+    modelGroup.add(ankleR);
+
+    // Symmetrical Feet (Sleek natural anatomical wedge shape)
+    const footBaseGeo = new THREE.BoxGeometry(0.085 * scaleX, 0.06 * scaleY, 0.165 * scaleX);
+    
+    const footL = new THREE.Mesh(footBaseGeo, skinMat);
+    footL.position.set(-legXOffset, actualAnkleY - 0.02 * scaleY, 0.045 * scaleX);
+    footL.castShadow = true;
+    footL.receiveShadow = true;
+    modelGroup.add(footL);
+
+    const footR = new THREE.Mesh(footBaseGeo, skinMat);
+    footR.position.set(legXOffset, actualAnkleY - 0.02 * scaleY, 0.045 * scaleX);
+    footR.castShadow = true;
+    footR.receiveShadow = true;
+    modelGroup.add(footR);
+
+    // Symmetrical ARMS and Joint Spheres (Shoulders & Elbows)
+    const armXOffset = 0.28 * scaleX;
+    const armLength = 0.44 * scaleY;
+    const armY = chestY + 0.12 * scaleY;
+
+    // Symmetrical Shoulder Joint Spheres
+    const shoulderGeo = new THREE.SphereGeometry(0.055 * scaleX, 32, 32);
+    
+    const shoulderL = new THREE.Mesh(shoulderGeo, skinMat);
+    shoulderL.position.set(-armXOffset, armY, 0);
+    shoulderL.castShadow = true;
+    shoulderL.receiveShadow = true;
+    modelGroup.add(shoulderL);
+
+    const shoulderR = new THREE.Mesh(shoulderGeo, skinMat);
+    shoulderR.position.set(armXOffset, armY, 0);
+    shoulderR.castShadow = true;
+    shoulderR.receiveShadow = true;
+    modelGroup.add(shoulderR);
+
+    // Left Arm (Base Skin)
+    const armLGeo = new THREE.CylinderGeometry(0.048 * scaleX, 0.04 * scaleX, armLength, 64);
+    const armL = new THREE.Mesh(armLGeo, skinMat);
+    armL.position.set(-armXOffset, armY - armLength/2, 0);
+    armL.rotation.z = -0.05; // natural posture angle
+    armL.castShadow = true;
+    armL.receiveShadow = true;
+    modelGroup.add(armL);
+
+    // Right Arm (Base Skin - Mirrored)
+    const armRGeo = new THREE.CylinderGeometry(0.048 * scaleX, 0.04 * scaleX, armLength, 64);
+    const armR = new THREE.Mesh(armRGeo, skinMat);
+    armR.position.set(armXOffset, armY - armLength/2, 0);
+    armR.rotation.z = 0.05;
+    armR.castShadow = true;
+    armR.receiveShadow = true;
+    modelGroup.add(armR);
+
+    // Symmetrical Elbow Joint Spheres
+    const elbowGeo = new THREE.SphereGeometry(0.042 * scaleX, 32, 32);
+    
+    const elbowL = new THREE.Mesh(elbowGeo, skinMat);
+    elbowL.position.set(-armXOffset - 0.01 * scaleX, armY - armLength, 0.01 * scaleX);
+    elbowL.castShadow = true;
+    elbowL.receiveShadow = true;
+    modelGroup.add(elbowL);
+
+    const elbowR = new THREE.Mesh(elbowGeo, skinMat);
+    elbowR.position.set(armXOffset + 0.01 * scaleX, armY - armLength, 0.01 * scaleX);
+    elbowR.castShadow = true;
+    elbowR.receiveShadow = true;
+    modelGroup.add(elbowR);
+
+    // Left Forearm
+    const forearmLGeo = new THREE.CylinderGeometry(0.038 * scaleX, 0.032 * scaleX, armLength, 64);
+    const forearmL = new THREE.Mesh(forearmLGeo, skinMat);
+    forearmL.position.set(-armXOffset - 0.02 * scaleX, armY - armLength * 1.4, 0.02 * scaleX);
+    forearmL.rotation.x = 0.1;
+    forearmL.castShadow = true;
+    forearmL.receiveShadow = true;
+    modelGroup.add(forearmL);
+
+    // Right Forearm
+    const forearmRGeo = new THREE.CylinderGeometry(0.038 * scaleX, 0.032 * scaleX, armLength, 64);
+    const forearmR = new THREE.Mesh(forearmRGeo, skinMat);
+    forearmR.position.set(armXOffset + 0.02 * scaleX, armY - armLength * 1.4, 0.02 * scaleX);
+    forearmR.rotation.x = 0.1;
+    forearmR.castShadow = true;
+    forearmR.receiveShadow = true;
+    modelGroup.add(forearmR);
+
+    // Symmetrical Hands (clean small rounded boxes/capsules)
+    const handGeo = new THREE.SphereGeometry(0.032 * scaleX, 32, 32);
+    
+    const handL = new THREE.Mesh(handGeo, skinMat);
+    handL.position.set(-armXOffset - 0.02 * scaleX, armY - armLength * 1.9, 0.04 * scaleX);
+    handL.castShadow = true;
+    handL.receiveShadow = true;
+    modelGroup.add(handL);
+
+    const handR = new THREE.Mesh(handGeo, skinMat);
+    handR.position.set(armXOffset + 0.02 * scaleX, armY - armLength * 1.9, 0.04 * scaleX);
+    handR.castShadow = true;
+    handR.receiveShadow = true;
+    modelGroup.add(handR);
+
+
+    // ==========================================
+    // 2. TOPS LAYER (Styled 3D Garments)
+    // ==========================================
+    const topItem = items.top;
+    if (topItem.visible) {
+      const topMat = makeClotheMat(topItem);
+      const topAccent = makeAccentMat(topItem);
+      const topPiping = makePipingMat(topItem);
+
+      // Overlap offset for clothing layers
+      const fitOffset = 0.022;
+
+      // Check tops styles
+      if (topItem.style === 'tshirt') {
+        // Torso container
+        const shirtTorsoGeo = new THREE.CylinderGeometry(
+          (0.21 + fitOffset) * scaleX,
+          (0.17 + fitOffset) * scaleX,
+          chestHeight * 1.020,
+          64
+        );
+        const shirt = new THREE.Mesh(shirtTorsoGeo, topMat);
+        shirt.position.set(0, chestY, 0);
+        shirt.castShadow = true;
+        shirt.receiveShadow = true;
+        modelGroup.add(shirt);
+
+        // Shoulder short sleeve sleeves
+        const sleeveLength = 0.18 * scaleY;
+        const sleeveGeo = new THREE.CylinderGeometry(
+          (0.055 + fitOffset) * scaleX,
+          (0.046 + fitOffset) * scaleX,
+          sleeveLength,
+          64
+        );
+
+        const sleeveL = new THREE.Mesh(sleeveGeo, topMat);
+        sleeveL.position.set(-armXOffset, armY - sleeveLength/2, 0);
+        sleeveL.rotation.z = -0.05;
+        sleeveL.castShadow = true;
+        modelGroup.add(sleeveL);
+
+        const sleeveR = new THREE.Mesh(sleeveGeo, topMat);
+        sleeveR.position.set(armXOffset, armY - sleeveLength/2, 0);
+        sleeveR.rotation.z = 0.05;
+        sleeveR.castShadow = true;
+        modelGroup.add(sleeveR);
+
+        // High fidelity neck collar collar ring
+        const collarRingGeo = new THREE.TorusGeometry(0.082 * scaleX, 0.015, 16, 64);
+        const collarRing = new THREE.Mesh(collarRingGeo, topAccent);
+        collarRing.rotation.x = Math.PI / 2;
+        collarRing.position.set(0, chestY + chestHeight/2 - 0.01, 0);
+        modelGroup.add(collarRing);
+
+      } else if (topItem.style === 'hoodie') {
+        // Bulkier fit
+        const hoodieFit = 0.048;
+        const hoodieHeight = chestHeight * 1.08;
+        const hoodieTorsoGeo = new THREE.CylinderGeometry(
+          (0.21 + hoodieFit) * scaleX,
+          (0.18 + hoodieFit) * scaleX,
+          hoodieHeight,
+          64
+        );
+        const hoodie = new THREE.Mesh(hoodieTorsoGeo, topMat);
+        hoodie.position.set(0, chestY - 0.02 * scaleY, 0);
+        hoodie.castShadow = true;
+        hoodie.receiveShadow = true;
+        modelGroup.add(hoodie);
+
+        // Bulky pockets kangaroo pouch on stomach
+        const pouchGeo = new THREE.BoxGeometry(0.22 * scaleX, 0.15 * scaleY, 0.055 * scaleX);
+        const pouch = new THREE.Mesh(pouchGeo, topAccent);
+        pouch.position.set(0, chestY - 0.12 * scaleY, (0.17 + hoodieFit) * scaleZOffset(scaleX));
+        pouch.castShadow = true;
+        modelGroup.add(pouch);
+
+        // Long slouched sleeves that extend past elbows
+        const longSleeveLength = 0.72 * scaleY;
+        const sleeveGeo = new THREE.CylinderGeometry(
+          (0.055 + hoodieFit) * scaleX,
+          (0.042 + hoodieFit) * scaleX,
+          longSleeveLength,
+          64
+        );
+
+        const sleeveL = new THREE.Mesh(sleeveGeo, topMat);
+        sleeveL.position.set(-armXOffset - 0.01, armY - longSleeveLength/2, 0.01);
+        sleeveL.rotation.z = -0.06;
+        sleeveL.castShadow = true;
+        modelGroup.add(sleeveL);
+
+        const sleeveR = new THREE.Mesh(sleeveGeo, topMat);
+        sleeveR.position.set(armXOffset + 0.01, armY - longSleeveLength/2, 0.01);
+        sleeveR.rotation.z = 0.06;
+        sleeveR.castShadow = true;
+        modelGroup.add(sleeveR);
+
+        // Cozy fabric fold hood on reverse back shoulder area
+        const hoodGeo = new THREE.SphereGeometry(0.18, 32, 24);
+        const hood = new THREE.Mesh(hoodGeo, topAccent);
+        hood.position.set(0, headY - 0.15 * scaleY, -0.15 * scaleX);
+        hood.castShadow = true;
+        modelGroup.add(hood);
+
+        // Hoodie metallic drawstring ropes
+        const ropeGeo = new THREE.CylinderGeometry(0.006, 0.006, 0.28 * scaleY, 16);
+        const ropeTipGeo = new THREE.CylinderGeometry(0.01, 0.01, 0.02, 16);
+        const silverMat = new THREE.MeshStandardMaterial({ color: 0xcbd5e1, metalness: 0.8, roughness: 0.2 });
+
+        const ropeL = new THREE.Mesh(ropeGeo, topPiping);
+        ropeL.position.set(-0.06 * scaleX, chestY + 0.15 * scaleY, 0.21 * scaleX);
+        ropeL.rotation.z = 0.08;
+        modelGroup.add(ropeL);
+
+        const tipL = new THREE.Mesh(ropeTipGeo, silverMat);
+        tipL.position.set(-0.07 * scaleX, chestY + 0.01 * scaleY, 0.21 * scaleX);
+        modelGroup.add(tipL);
+
+        const ropeR = new THREE.Mesh(ropeGeo, topPiping);
+        ropeR.position.set(0.06 * scaleX, chestY + 0.15 * scaleY, 0.21 * scaleX);
+        ropeR.rotation.z = -0.08;
+        modelGroup.add(ropeR);
+
+        const tipR = new THREE.Mesh(ropeTipGeo, silverMat);
+        tipR.position.set(0.07 * scaleX, chestY + 0.01 * scaleY, 0.21 * scaleX);
+        modelGroup.add(tipR);
+
+      } else if (topItem.style === 'sweater') {
+        const knitFit = 0.04;
+        const sweaterHeight = chestHeight * 1.05;
+        const sweaterTorsoGeo = new THREE.CylinderGeometry(
+          (0.21 + knitFit) * scaleX,
+          (0.18 + knitFit) * scaleX,
+          sweaterHeight,
+          64
+        );
+        const sweater = new THREE.Mesh(sweaterTorsoGeo, topMat);
+        sweater.position.set(0, chestY - 0.01 * scaleY, 0);
+        sweater.castShadow = true;
+        sweater.receiveShadow = true;
+        modelGroup.add(sweater);
+
+        // Long sweater sleeves
+        const longSleeveLength = 0.74 * scaleY;
+        const sleeveGeo = new THREE.CylinderGeometry(
+          (0.055 + knitFit) * scaleX,
+          (0.042 + knitFit) * scaleX,
+          longSleeveLength,
+          64
+        );
+
+        const sleeveL = new THREE.Mesh(sleeveGeo, topMat);
+        sleeveL.position.set(-armXOffset, armY - longSleeveLength/2, 0);
+        sleeveL.rotation.z = -0.05;
+        sleeveL.castShadow = true;
+        modelGroup.add(sleeveL);
+
+        const sleeveR = new THREE.Mesh(sleeveGeo, topMat);
+        sleeveR.position.set(armXOffset, armY - longSleeveLength/2, 0);
+        sleeveR.rotation.z = 0.05;
+        sleeveR.castShadow = true;
+        modelGroup.add(sleeveR);
+
+        // Ribbed cuffs
+        const cuffGeo = new THREE.CylinderGeometry((0.042 + knitFit) * scaleX, (0.042 + knitFit) * scaleX, 0.04, 64);
+        
+        const cuffL = new THREE.Mesh(cuffGeo, topAccent);
+        cuffL.position.set(-armXOffset, armY - longSleeveLength + 0.02, 0);
+        modelGroup.add(cuffL);
+
+        const cuffR = new THREE.Mesh(cuffGeo, topAccent);
+        cuffR.position.set(armXOffset, armY - longSleeveLength + 0.02, 0);
+        modelGroup.add(cuffR);
+
+        // Thick Crewneck collar ribbed rim
+        const sweaterBandGeo = new THREE.CylinderGeometry((0.10 * scaleX) + knitFit * scaleX, (0.10 * scaleX) + knitFit * scaleX, 0.033, 64);
+        const band = new THREE.Mesh(sweaterBandGeo, topAccent);
+        band.position.set(0, chestY + sweaterHeight/2, 0);
+        modelGroup.add(band);
+
+      } else if (topItem.style === 'croptop') {
+        // High waist exposure crop fit
+        const cropHeight = chestHeight * 0.55;
+        const cropTorsoGeo = new THREE.CylinderGeometry(
+          (0.215 + fitOffset) * scaleX,
+          (0.198 + fitOffset) * scaleX,
+          cropHeight,
+          64
+        );
+        const croptop = new THREE.Mesh(cropTorsoGeo, topMat);
+        croptop.position.set(0, chestY + cropHeight / 2.2, 0);
+        croptop.castShadow = true;
+        modelGroup.add(croptop);
+
+        // Shoulder thin support straps
+        const strapGeo = new THREE.CylinderGeometry(0.010, 0.010, 0.18 * scaleY, 32);
+        
+        const strapL = new THREE.Mesh(strapGeo, topAccent);
+        strapL.position.set(-0.11 * scaleX, chestY + cropHeight * 0.9, 0.12 * scaleX);
+        strapL.rotation.z = 0.1;
+        modelGroup.add(strapL);
+
+        const strapR = new THREE.Mesh(strapGeo, topAccent);
+        strapR.position.set(0.11 * scaleX, chestY + cropHeight * 0.9, 0.12 * scaleX);
+        strapR.rotation.z = -0.1;
+        modelGroup.add(strapR);
+
+      } else if (topItem.style === 'tanktop') {
+        const tankFit = 0.022;
+        const tankTorsoGeo = new THREE.CylinderGeometry(
+          (0.21 + tankFit) * scaleX,
+          (0.17 + tankFit) * scaleX,
+          chestHeight * 1.01,
+          64
+        );
+        const tank = new THREE.Mesh(tankTorsoGeo, topMat);
+        tank.position.set(0, chestY, 0);
+        tank.castShadow = true;
+        tank.receiveShadow = true;
+        modelGroup.add(tank);
+
+        // Detailed sleeveless racer armholes layout outlines
+        const armholeTrimGeo = new THREE.TorusGeometry(0.09 * scaleX, 0.01, 16, 64);
+        
+        const holeL = new THREE.Mesh(armholeTrimGeo, topAccent);
+        holeL.position.set(-armXOffset + 0.08 * scaleX, armY, 0);
+        holeL.rotation.y = Math.PI / 2;
+        modelGroup.add(holeL);
+
+        const holeR = new THREE.Mesh(armholeTrimGeo, topAccent);
+        holeR.position.set(armXOffset - 0.08 * scaleX, armY, 0);
+        holeR.rotation.y = Math.PI / 2;
+        modelGroup.add(holeR);
+
+      } else if (topItem.style === 'blazer') {
+        // Blazer jacket shell left and right open folds
+        const blazerFit = 0.038;
+        const blazerHeight = chestHeight * 1.05;
+        const blazerGeo = new THREE.CylinderGeometry(
+          (0.222 + blazerFit) * scaleX,
+          (0.185 + blazerFit) * scaleX,
+          blazerHeight,
+          64,
+          1,
+          true,
+          0.65, // partial cylinder to simulate open double breasted outer look
+          Math.PI * 1.65
+        );
+        const blazer = new THREE.Mesh(blazerGeo, topMat);
+        blazer.position.set(0, chestY, 0);
+        blazer.rotation.y = Math.PI;
+        blazer.castShadow = true;
+        modelGroup.add(blazer);
+
+        // Sleek white dynamic inner collar shirt inside blazer
+        const innerShirtGeo = new THREE.CylinderGeometry(0.198 * scaleX, 0.17 * scaleX, chestHeight * 0.95, 64);
+        const whiteMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.65 });
+        const innerShirt = new THREE.Mesh(innerShirtGeo, whiteMat);
+        innerShirt.position.set(0, chestY, 0.01 * scaleX);
+        modelGroup.add(innerShirt);
+
+        // Highly detailed 3D Tie hanging down
+        const tieGeo = new THREE.BoxGeometry(0.038 * scaleX, 0.28 * scaleY, 0.015 * scaleX);
+        const tie = new THREE.Mesh(tieGeo, topPiping);
+        tie.position.set(0, chestY + 0.05 * scaleY, 0.187 * scaleX);
+        tie.rotation.x = 0.05;
+        tie.castShadow = true;
+        modelGroup.add(tie);
+
+        // Golden metallic closure button in lower chest
+        const btnGeo = new THREE.SphereGeometry(0.016, 16, 16);
+        const goldMat = new THREE.MeshStandardMaterial({ color: 0xca8a04, metalness: 0.85, roughness: 0.1 });
+        const button = new THREE.Mesh(btnGeo, goldMat);
+        button.position.set(0, chestY - 0.08 * scaleY, 0.225 * scaleX);
+        modelGroup.add(button);
+
+        // Tailored tailored long coat sleeves
+        const coatSleeveLength = 0.72 * scaleY;
+        const sleeveGeo = new THREE.CylinderGeometry(
+          (0.055 + blazerFit) * scaleX,
+          (0.042 + blazerFit) * scaleX,
+          coatSleeveLength,
+          64
+        );
+
+        const sleeveL = new THREE.Mesh(sleeveGeo, topMat);
+        sleeveL.position.set(-armXOffset, armY - coatSleeveLength/2, 0);
+        sleeveL.rotation.z = -0.05;
+        sleeveL.castShadow = true;
+        modelGroup.add(sleeveL);
+
+        const sleeveR = new THREE.Mesh(sleeveGeo, topMat);
+        sleeveR.position.set(armXOffset, armY - coatSleeveLength/2, 0);
+        sleeveR.rotation.z = 0.05;
+        sleeveR.castShadow = true;
+        modelGroup.add(sleeveR);
+      }
+    }
+
+
+    // ==========================================
+    // 3. BOTTOMS LAYER (Jeans, Skirts, etc.)
+    // ==========================================
+    const bottomItem = items.bottom;
+    if (bottomItem.visible) {
+      const bMat = makeClotheMat(bottomItem);
+      const bAccent = makeAccentMat(bottomItem);
+      const bPiping = makePipingMat(bottomItem);
+
+      const pantsFit = 0.022;
+
+      if (bottomItem.style === 'jeans') {
+        // Waistband / hip wrap
+        const waistGeo = new THREE.CylinderGeometry(
+          (0.185 + pantsFit) * scaleX,
+          (0.208 + pantsFit) * scaleX,
+          pelvisHeight * 1.05,
+          64
+        );
+        const waist = new THREE.Mesh(waistGeo, bMat);
+        waist.position.set(0, pelvisY, 0);
+        waist.castShadow = true;
+        waist.receiveShadow = true;
+        modelGroup.add(waist);
+
+        // Left full leg sleeve
+        const legSleeveHeight = (upperLegLength + lowerLegLength) * 0.98;
+        const legSleeveGeo = new THREE.CylinderGeometry(
+          (0.088 + pantsFit) * scaleX,
+          (0.065 + pantsFit) * scaleX,
+          legSleeveHeight,
+          64
+        );
+
+        const legL = new THREE.Mesh(legSleeveGeo, bMat);
+        legL.position.set(-legXOffset, pelvisY - pelvisHeight/2 - legSleeveHeight/2, 0);
+        legL.castShadow = true;
+        modelGroup.add(legL);
+
+        // Right full leg sleeve (Mirrored perfectly)
+        const legR = new THREE.Mesh(legSleeveGeo, bMat);
+        legR.position.set(legXOffset, pelvisY - pelvisHeight/2 - legSleeveHeight/2, 0);
+        legR.castShadow = true;
+        modelGroup.add(legR);
+
+        // Contrast denim copper waist belt loops
+        const beltLoopGeo = new THREE.BoxGeometry(0.012, 0.05, 0.015);
+        for (let i = 0; i < 5; i++) {
+          const loop = new THREE.Mesh(beltLoopGeo, bAccent);
+          const angle = (i - 2) * 0.55;
+          const r = (0.19 + pantsFit) * scaleX;
+          loop.position.set(Math.sin(angle) * r, pelvisY + 0.08 * scaleY, Math.cos(angle) * r);
+          loop.rotation.y = angle;
+          modelGroup.add(loop);
+        }
+
+      } else if (bottomItem.style === 'shorts') {
+        const waistGeo = new THREE.CylinderGeometry(
+          (0.185 + pantsFit) * scaleX,
+          (0.208 + pantsFit) * scaleX,
+          pelvisHeight * 1.05,
+          64
+        );
+        const waist = new THREE.Mesh(waistGeo, bMat);
+        waist.position.set(0, pelvisY, 0);
+        waist.castShadow = true;
+        modelGroup.add(waist);
+
+        // Short leg cuffs cut in upper thighs
+        const shortHeight = upperLegLength * 0.55;
+        const legSleeveGeo = new THREE.CylinderGeometry(
+          (0.09 + pantsFit) * scaleX,
+          (0.08 + pantsFit) * scaleX,
+          shortHeight,
+          64
+        );
+
+        const legL = new THREE.Mesh(legSleeveGeo, bMat);
+        legL.position.set(-legXOffset, pelvisY - pelvisHeight/2 - shortHeight/2, 0);
+        legL.castShadow = true;
+        modelGroup.add(legL);
+
+        const legR = new THREE.Mesh(legSleeveGeo, bMat);
+        legR.position.set(legXOffset, pelvisY - pelvisHeight/2 - shortHeight/2, 0);
+        legR.castShadow = true;
+        modelGroup.add(legR);
+
+      } else if (bottomItem.style === 'skirt') {
+        // High fidelity flared pleated cone/skirt
+        const skirtTopRad = (0.17 + pantsFit) * scaleX;
+        const skirtBotRad = (0.42 + pantsFit) * scaleX;
+        const skirtLength = 0.44 * scaleY;
+
+        const skirtGeo = new THREE.CylinderGeometry(skirtTopRad, skirtBotRad, skirtLength, 64, 1, true);
+        const skirt = new THREE.Mesh(skirtGeo, bMat);
+        skirt.position.set(0, pelvisY - skirtLength/3, 0);
+        skirt.castShadow = true;
+        skirt.receiveShadow = true;
+        modelGroup.add(skirt);
+
+        // Skirt high waist solid belt strap banding
+        const beltBandGeo = new THREE.CylinderGeometry((0.185 + pantsFit) * scaleX, (0.185 + pantsFit) * scaleX, 0.05, 64);
+        const belt = new THREE.Mesh(beltBandGeo, bAccent);
+        belt.position.set(0, pelvisY + 0.08 * scaleY, 0);
+        modelGroup.add(belt);
+
+        // Polished golden rectangular belt buckle
+        const buckleGeo = new THREE.BoxGeometry(0.05 * scaleX, 0.038 * scaleY, 0.02 * scaleX);
+        const buckle = new THREE.Mesh(buckleGeo, bPiping);
+        buckle.position.set(0, pelvisY + 0.08 * scaleY, (0.188 + pantsFit) * scaleZOffset(scaleX));
+        modelGroup.add(buckle);
+
+      } else if (bottomItem.style === 'cargo') {
+        const cargoFit = 0.040;
+        const waistGeo = new THREE.CylinderGeometry(
+          (0.185 + cargoFit) * scaleX,
+          (0.208 + cargoFit) * scaleX,
+          pelvisHeight * 1.05,
+          64
+        );
+        const waist = new THREE.Mesh(waistGeo, bMat);
+        waist.position.set(0, pelvisY, 0);
+        waist.castShadow = true;
+        modelGroup.add(waist);
+
+        // Symmetrical baggy cargo legs
+        const legSleeveHeight = (upperLegLength + lowerLegLength) * 0.98;
+        const legSleeveGeo = new THREE.CylinderGeometry(
+          (0.10 + cargoFit) * scaleX,
+          (0.08 + cargoFit) * scaleX,
+          legSleeveHeight,
+          64
+        );
+
+        const legL = new THREE.Mesh(legSleeveGeo, bMat);
+        legL.position.set(-legXOffset, pelvisY - pelvisHeight/2 - legSleeveHeight/2, 0);
+        legL.castShadow = true;
+        modelGroup.add(legL);
+
+        const legR = new THREE.Mesh(legSleeveGeo, bMat);
+        legR.position.set(legXOffset, pelvisY - pelvisHeight/2 - legSleeveHeight/2, 0);
+        legR.castShadow = true;
+        modelGroup.add(legR);
+
+        // Symmetrical 3D Pocket blocks protruding from side of cargo legs!
+        const pocketGeo = new THREE.BoxGeometry(0.07 * scaleX, 0.12 * scaleY, 0.06 * scaleX);
+        
+        const pocketL = new THREE.Mesh(pocketGeo, bAccent);
+        pocketL.position.set(-legXOffset - (0.10 + cargoFit) * scaleX, pelvisY - pelvisHeight/2 - upperLegLength + 0.05, 0);
+        pocketL.rotation.y = Math.PI / 2;
+        pocketL.castShadow = true;
+        modelGroup.add(pocketL);
+
+        const pocketR = new THREE.Mesh(pocketGeo, bAccent);
+        pocketR.position.set(legXOffset + (0.10 + cargoFit) * scaleX, pelvisY - pelvisHeight/2 - upperLegLength + 0.05, 0);
+        pocketR.rotation.y = -Math.PI / 2;
+        pocketR.castShadow = true;
+        modelGroup.add(pocketR);
+
+      } else if (bottomItem.style === 'joggers') {
+        const jogFit = 0.032;
+        const waistGeo = new THREE.CylinderGeometry(
+          (0.185 + jogFit) * scaleX,
+          (0.208 + jogFit) * scaleX,
+          pelvisHeight * 1.05,
+          64
+        );
+        const waist = new THREE.Mesh(waistGeo, bMat);
+        waist.position.set(0, pelvisY, 0);
+        waist.castShadow = true;
+        modelGroup.add(waist);
+
+        // Symmetrical joggers leg sleeves
+        const legSleeveHeight = (upperLegLength + lowerLegLength) * 0.95;
+        const legSleeveGeo = new THREE.CylinderGeometry(
+          (0.095 + jogFit) * scaleX,
+          (0.068 + jogFit) * scaleX,
+          legSleeveHeight,
+          64
+        );
+
+        const legL = new THREE.Mesh(legSleeveGeo, bMat);
+        legL.position.set(-legXOffset, pelvisY - pelvisHeight/2 - legSleeveHeight/2, 0);
+        legL.castShadow = true;
+        modelGroup.add(legL);
+
+        const legR = new THREE.Mesh(legSleeveGeo, bMat);
+        legR.position.set(legXOffset, pelvisY - pelvisHeight/2 - legSleeveHeight/2, 0);
+        legR.castShadow = true;
+        modelGroup.add(legR);
+
+        // Sporty side vertical contrast mesh piping tape running down the legs
+        const stripeGeo = new THREE.BoxGeometry(0.015 * scaleX, legSleeveHeight, 0.015 * scaleX);
+        
+        const stripeL = new THREE.Mesh(stripeGeo, bPiping);
+        stripeL.position.set(-legXOffset - (0.095 + jogFit) * scaleX, pelvisY - pelvisHeight/2 - legSleeveHeight/2, 0.01);
+        modelGroup.add(stripeL);
+
+        const stripeR = new THREE.Mesh(stripeGeo, bPiping);
+        stripeR.position.set(legXOffset + (0.095 + jogFit) * scaleX, pelvisY - pelvisHeight/2 - legSleeveHeight/2, 0.01);
+        modelGroup.add(stripeR);
+
+        // elastic cuff cuffs on ankles wrapping ankles
+        const cuffL = new THREE.Mesh(new THREE.CylinderGeometry(0.068 * scaleX, 0.068 * scaleX, 0.05, 64), bAccent);
+        cuffL.position.set(-legXOffset, actualAnkleY + 0.025 * scaleY, 0);
+        modelGroup.add(cuffL);
+
+        const cuffR = new THREE.Mesh(new THREE.CylinderGeometry(0.068 * scaleX, 0.068 * scaleX, 0.05, 64), bAccent);
+        cuffR.position.set(legXOffset, actualAnkleY + 0.025 * scaleY, 0);
+        modelGroup.add(cuffR);
+      }
+    }
+
+
+    // ==========================================
+    // 4. FOOTWEAR LAYER (Beautiful Symmetrical Shoes)
+    // ==========================================
+    const footItem = items.footwear;
+    if (footItem.visible) {
+      const fMat = makeClotheMat(footItem);
+      const fAccent = makeAccentMat(footItem);
+      const fPiping = makePipingMat(footItem);
+
+      const footYPos = actualAnkleY - 0.02 * scaleY;
+
+      if (footItem.style === 'sneakers') {
+        // Left athletic shoe box
+        const footLGeo = new THREE.BoxGeometry(0.12 * scaleX, 0.09 * scaleY, 0.22 * scaleX);
+        const shoeL = new THREE.Mesh(footLGeo, fMat);
+        shoeL.position.set(-legXOffset, footYPos, 0.05 * scaleX);
+        shoeL.castShadow = true;
+        modelGroup.add(shoeL);
+
+        // Chunky sneakers platform sole
+        const soleLGeo = new THREE.BoxGeometry(0.13 * scaleX, 0.03 * scaleY, 0.24 * scaleX);
+        const soleL = new THREE.Mesh(soleLGeo, new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5 }));
+        soleL.position.set(-legXOffset, footYPos - 0.05 * scaleY, 0.05 * scaleX);
+        soleL.castShadow = true;
+        modelGroup.add(soleL);
+
+        // Right Shoe (Symmetrical mirror)
+        const shoeR = new THREE.Mesh(footLGeo, fMat);
+        shoeR.position.set(legXOffset, footYPos, 0.05 * scaleX);
+        shoeR.castShadow = true;
+        modelGroup.add(shoeR);
+
+        const soleR = new THREE.Mesh(soleLGeo, new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5 }));
+        soleR.position.set(legXOffset, footYPos - 0.05 * scaleY, 0.05 * scaleX);
+        soleR.castShadow = true;
+        modelGroup.add(soleR);
+
+      } else if (footItem.style === 'boots') {
+        const bootHeight = 0.22 * scaleY;
+        const bootLegGeo = new THREE.CylinderGeometry(0.082 * scaleX, 0.085 * scaleX, bootHeight, 32);
+        
+        // Left rugged boot leg sleeve
+        const bootLegL = new THREE.Mesh(bootLegGeo, fMat);
+        bootLegL.position.set(-legXOffset, footYPos + bootHeight/2.5, 0.01);
+        bootLegL.castShadow = true;
+        modelGroup.add(bootLegL);
+
+        const bootFootGeo = new THREE.BoxGeometry(0.12 * scaleX, 0.11 * scaleY, 0.23 * scaleX);
+        const bootFootL = new THREE.Mesh(bootFootGeo, fAccent);
+        bootFootL.position.set(-legXOffset, footYPos, 0.05 * scaleX);
+        bootFootL.castShadow = true;
+        modelGroup.add(bootFootL);
+
+        // Right Boot (Perfect mirror)
+        const bootLegR = new THREE.Mesh(bootLegGeo, fMat);
+        bootLegR.position.set(legXOffset, footYPos + bootHeight/2.5, 0.01);
+        bootLegR.castShadow = true;
+        modelGroup.add(bootLegR);
+
+        const bootFootR = new THREE.Mesh(bootFootGeo, fAccent);
+        bootFootR.position.set(legXOffset, footYPos, 0.05 * scaleX);
+        bootFootR.castShadow = true;
+        modelGroup.add(bootFootR);
+
+        // Chunky tactical lug soles
+        const soleGeo = new THREE.BoxGeometry(0.13 * scaleX, 0.045 * scaleY, 0.24 * scaleX);
+        
+        const soleL = new THREE.Mesh(soleGeo, fPiping);
+        soleL.position.set(-legXOffset, footYPos - 0.06 * scaleY, 0.05 * scaleX);
+        modelGroup.add(soleL);
+
+        const soleR = new THREE.Mesh(soleGeo, fPiping);
+        soleR.position.set(legXOffset, footYPos - 0.06 * scaleY, 0.05 * scaleX);
+        modelGroup.add(soleR);
+
+      } else if (footItem.style === 'sandals') {
+        // Flat sole slice
+        const soleGeo = new THREE.BoxGeometry(0.12 * scaleX, 0.02 * scaleY, 0.22 * scaleX);
+        
+        const soleL = new THREE.Mesh(soleGeo, fMat);
+        soleL.position.set(-legXOffset, footYPos - 0.04 * scaleY, 0.05 * scaleX);
+        modelGroup.add(soleL);
+
+        const soleR = new THREE.Mesh(soleGeo, fMat);
+        soleR.position.set(legXOffset, footYPos - 0.04 * scaleY, 0.05 * scaleX);
+        modelGroup.add(soleR);
+
+        // Elegant cross-strap arches
+        const strapGeo = new THREE.TorusGeometry(0.06 * scaleX, 0.012, 16, 24);
+        
+        const strapL = new THREE.Mesh(strapGeo, fAccent);
+        strapL.position.set(-legXOffset, footYPos, 0.04 * scaleX);
+        strapL.rotation.y = Math.PI / 2;
+        modelGroup.add(strapL);
+
+        const strapR = new THREE.Mesh(strapGeo, fAccent);
+        strapR.position.set(legXOffset, footYPos, 0.04 * scaleX);
+        strapR.rotation.y = Math.PI / 2;
+        modelGroup.add(strapR);
+
+      } else if (footItem.style === 'dress_shoes') {
+        const shoeGeo = new THREE.BoxGeometry(0.11 * scaleX, 0.075 * scaleY, 0.21 * scaleX);
+        // Deep shiny patent leather material for luxury appearance!
+        const glossyDressMat = new THREE.MeshStandardMaterial({
+          color: new THREE.Color(footItem.color.primary),
+          roughness: 0.12, // highly reflective
+          metalness: 0.15
+        });
+
+        // Left shoe
+        const shoeL = new THREE.Mesh(shoeGeo, glossyDressMat);
+        shoeL.position.set(-legXOffset, footYPos, 0.04 * scaleX);
+        shoeL.castShadow = true;
+        modelGroup.add(shoeL);
+
+        // Right Shoe (Symmetrical mirror)
+        const shoeR = new THREE.Mesh(shoeGeo, glossyDressMat);
+        shoeR.position.set(legXOffset, footYPos, 0.04 * scaleX);
+        shoeR.castShadow = true;
+        modelGroup.add(shoeR);
+
+        // Elegant gold buckle strap
+        const buckleGeo = new THREE.BoxGeometry(0.02 * scaleX, 0.012 * scaleY, 0.12 * scaleX);
+        const buckleL = new THREE.Mesh(buckleGeo, fPiping);
+        buckleL.position.set(-legXOffset - 0.045 * scaleX, footYPos + 0.03 * scaleY, 0.03 * scaleX);
+        modelGroup.add(buckleL);
+
+        const buckleR = new THREE.Mesh(buckleGeo, fPiping);
+        buckleR.position.set(legXOffset + 0.045 * scaleX, footYPos + 0.03 * scaleY, 0.03 * scaleX);
+        modelGroup.add(buckleR);
+      }
+    }
+
+
+    // ==========================================
+    // 5. HAIR LAYER (Layered 3D Flow Sculpt)
+    // ==========================================
+    const hairItem = items.hair;
+    if (hairItem.visible && hairItem.style !== 'none') {
+      const hMat = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(hairItem.color.primary),
+        roughness: 0.85,
+        metalness: 0.01 // realistic organic matte
+      });
+      const hAccent = new THREE.MeshStandardMaterial({
+        color: new THREE.Color(hairItem.color.secondary),
+        roughness: 0.8
+      });
+
+      if (hairItem.style === 'crop') {
+        // Close-cut cap wrap around skull top
+        const cropGeo = new THREE.SphereGeometry(0.233, 16, 16, 0, Math.PI * 2, 0, Math.PI / 2);
+        const crop = new THREE.Mesh(cropGeo, hMat);
+        crop.position.set(0, headY + 0.01, 0);
+        crop.scale.set(scaleX, 1, scaleX);
+        modelGroup.add(crop);
+
+        // Spiky tufts in front
+        const fringeGeo = new THREE.ConeGeometry(0.04, 0.1, 4);
+        for (let i = 0; i < 4; i++) {
+          const spike = new THREE.Mesh(fringeGeo, hMat);
+          spike.rotation.x = 2.2;
+          spike.position.set((-0.1 + i * 0.06) * scaleX, headY + 0.12, 0.18 * scaleX);
+          modelGroup.add(spike);
+        }
+
+      } else if (hairItem.style === 'waves') {
+        // Floating waves flanking head sphere sides and falling down shoulders
+        const cropGeo = new THREE.SphereGeometry(0.235, 16, 16);
+        const base = new THREE.Mesh(cropGeo, hMat);
+        base.position.set(0, headY, 0.01);
+        modelGroup.add(base);
+
+        // Wave loops
+        for (let i = 0; i < 6; i++) {
+          const waveGeo = new THREE.SphereGeometry(0.12, 12, 12);
+          const loop = new THREE.Mesh(waveGeo, hAccent);
+          const angle = (i * Math.PI) / 3;
+          loop.position.set(
+            Math.sin(angle) * 0.22 * scaleX,
+            headY - 0.05 - (i % 2) * 0.08,
+            Math.cos(angle) * 0.18 * scaleX
+          );
+          loop.castShadow = true;
+          modelGroup.add(loop);
+        }
+
+      } else if (hairItem.style === 'bob') {
+        // Symmetric helmet/straight cut bob hair draping sides of face
+        const domeGeo = new THREE.SphereGeometry(0.24, 16, 16, 0, Math.PI * 2, 0, Math.PI * 0.65);
+        const dome = new THREE.Mesh(domeGeo, hMat);
+        dome.position.set(0, headY + 0.02, 0);
+        dome.scale.set(scaleX, 1, scaleX);
+        modelGroup.add(dome);
+
+        // Flanking straight extensions
+        const strandGeo = new THREE.BoxGeometry(0.06 * scaleX, 0.22 * scaleY, 0.16 * scaleX);
+        
+        const strandL = new THREE.Mesh(strandGeo, hMat);
+        strandL.position.set(-0.21 * scaleX, headY - 0.1 * scaleY, 0.05 * scaleX);
+        modelGroup.add(strandL);
+
+        const strandR = new THREE.Mesh(strandGeo, hMat);
+        strandR.position.set(0.21 * scaleX, headY - 0.1 * scaleY, 0.05 * scaleX);
+        modelGroup.add(strandR);
+
+      } else if (hairItem.style === 'mohawk') {
+        // Center strip punk mohawk spiky blocks
+        const mohawkGeo = new THREE.BoxGeometry(0.05 * scaleX, 0.12 * scaleY, 0.38 * scaleX);
+        const hawk = new THREE.Mesh(mohawkGeo, hMat);
+        hawk.position.set(0, headY + 0.18 * scaleY, -0.05 * scaleX);
+        hawk.rotation.x = -0.15;
+        hawk.castShadow = true;
+        modelGroup.add(hawk);
+
+        // Highlight tips
+        const tipsGeo = new THREE.BoxGeometry(0.052 * scaleX, 0.05 * scaleY, 0.385 * scaleX);
+        const tips = new THREE.Mesh(tipsGeo, hAccent);
+        tips.position.set(0, headY + 0.23 * scaleY, -0.05 * scaleX);
+        tips.rotation.x = -0.15;
+        modelGroup.add(tips);
+
+      } else if (hairItem.style === 'bun') {
+        // High crown top ball
+        const cropGeo = new THREE.SphereGeometry(0.233, 16, 16, 0, Math.PI * 2, 0, Math.PI / 2);
+        const crop = new THREE.Mesh(cropGeo, hMat);
+        crop.position.set(0, headY + 0.01, 0);
+        crop.scale.set(scaleX, 1, scaleX);
+        modelGroup.add(crop);
+
+        // Bun sphere sitting perfectly centered atop back crown
+        const bunBallGeo = new THREE.SphereGeometry(0.09, 12, 12);
+        const bunBall = new THREE.Mesh(bunBallGeo, hAccent);
+        bunBall.position.set(0, headY + 0.2 * scaleY, -0.09 * scaleX);
+        bunBall.castShadow = true;
+        modelGroup.add(bunBall);
+
+      } else if (hairItem.style === 'braids') {
+        // Strands dropping down symmetrically on chest front face
+        const domeGeo = new THREE.SphereGeometry(0.235, 16, 16, 0, Math.PI * 2, 0, Math.PI / 2);
+        const base = new THREE.Mesh(domeGeo, hMat);
+        base.position.set(0, headY + 0.01, 0);
+        base.scale.set(scaleX, 1, scaleX);
+        modelGroup.add(base);
+
+        // Plait braids dropping on chest front
+        for (let i = 0; i < 5; i++) {
+          const nodGeo = new THREE.SphereGeometry(0.032, 8, 8);
+          // Left braid chain link
+          const lNode = new THREE.Mesh(nodGeo, hMat);
+          lNode.position.set(-0.16 * scaleX, headY - 0.12 - i * 0.06, 0.17 * scaleX);
+          modelGroup.add(lNode);
+
+          // Right braid chain link
+          const rNode = new THREE.Mesh(nodGeo, hMat);
+          rNode.position.set(0.16 * scaleX, headY - 0.12 - i * 0.06, 0.17 * scaleX);
+          modelGroup.add(rNode);
+        }
+      }
+    }
+
+
+    // ==========================================
+    // 6. HEADWEAR LAYER (Visors, Crowns, Beanies)
+    // ==========================================
+    const hwItem = items.headwear;
+    if (hwItem.visible && hwItem.style !== 'none') {
+      const hwMat = makeClotheMat(hwItem);
+      const hwAccent = makeAccentMat(hwItem);
+
+      if (hwItem.style === 'cap') {
+        // Sleek baseball cap visor forward
+        const capDomeGeo = new THREE.SphereGeometry(0.245, 16, 16, 0, Math.PI * 2, 0, Math.PI / 1.9);
+        const capDome = new THREE.Mesh(capDomeGeo, hwMat);
+        capDome.position.set(0, headY + 0.03, -0.01);
+        capDome.rotation.x = -0.08;
+        capDome.scale.set(scaleX, 1, scaleX);
+        capDome.castShadow = true;
+        modelGroup.add(capDome);
+
+        // Forward elongated peak visor shield
+        const visorGeo = new THREE.BoxGeometry(0.21 * scaleX, 0.015 * scaleY, 0.14 * scaleX);
+        const visor = new THREE.Mesh(visorGeo, hwAccent);
+        visor.position.set(0, headY + 0.06, 0.2 * scaleX);
+        visor.rotation.x = 0.11;
+        modelGroup.add(visor);
+
+      } else if (hwItem.style === 'beanie') {
+        // Elongated snug dome beanies
+        const beanGeo = new THREE.CylinderGeometry(0.18 * scaleX, 0.245 * scaleX, 0.25, 32);
+        const beanie = new THREE.Mesh(beanGeo, hwMat);
+        beanie.position.set(0, headY + 0.12, 0);
+        beanie.rotation.x = -0.05;
+        beanie.castShadow = true;
+        modelGroup.add(beanie);
+
+        // Soft crown puff ball on beanie tip
+        const puffGeo = new THREE.SphereGeometry(0.045, 24, 24);
+        const puff = new THREE.Mesh(puffGeo, hwAccent);
+        puff.position.set(0, headY + 0.24, -0.02 * scaleX);
+        modelGroup.add(puff);
+
+      } else if (hwItem.style === 'sunhat') {
+        // Large horizontal disk flange
+        const capDomeGeo = new THREE.SphereGeometry(0.24, 32, 32, 0, Math.PI * 2, 0, Math.PI / 2);
+        const capDome = new THREE.Mesh(capDomeGeo, hwMat);
+        capDome.position.set(0, headY + 0.02, 0);
+        capDome.scale.set(scaleX, 1, scaleX);
+        modelGroup.add(capDome);
+
+        // Enormous brim halo plate
+        const brimGeo = new THREE.CylinderGeometry(0.55 * scaleX, 0.55 * scaleX, 0.012, 64);
+        const brim = new THREE.Mesh(brimGeo, hwMat);
+        brim.position.set(0, headY + 0.01, 0);
+        brim.castShadow = true;
+        modelGroup.add(brim);
+
+        // Decorative ribbon band wrapped at base
+        const ribbonGeo = new THREE.CylinderGeometry(0.246 * scaleX, 0.246 * scaleX, 0.02, 48);
+        const ribbon = new THREE.Mesh(ribbonGeo, hwAccent);
+        ribbon.position.set(0, headY + 0.03, 0);
+        modelGroup.add(ribbon);
+
+      } else if (hwItem.style === 'crown') {
+        // Real gold spiked royalty crown
+        const crownBaseGeo = new THREE.CylinderGeometry(0.222 * scaleX, 0.222 * scaleX, 0.04, 48);
+        const goldRoyalMat = new THREE.MeshStandardMaterial({ color: 0xeab308, metalness: 0.85, roughness: 0.1 });
+        const crownBase = new THREE.Mesh(crownBaseGeo, goldRoyalMat);
+        crownBase.position.set(0, headY + 0.21, 0);
+        crownBase.castShadow = true;
+        modelGroup.add(crownBase);
+
+        // Spikes surrounding boundary rim
+        const spikeGeo = new THREE.ConeGeometry(0.03 * scaleX, 0.09, 16);
+        for (let i = 0; i < 6; i++) {
+          const spike = new THREE.Mesh(spikeGeo, goldRoyalMat);
+          const angle = (i * Math.PI) / 3;
+          const r = 0.211 * scaleX;
+          spike.position.set(Math.sin(angle) * r, headY + 0.25, Math.cos(angle) * r);
+          spike.rotation.y = angle;
+          modelGroup.add(spike);
+        }
+
+      } else if (hwItem.style === 'headband') {
+        // Sleek headband hoop
+        const headbandGeo = new THREE.TorusGeometry(0.233 * scaleX, 0.016, 16, 48);
+        const headband = new THREE.Mesh(headbandGeo, hwMat);
+        headband.rotation.x = Math.PI / 1.8;
+        headband.position.set(0, headY + 0.02, 0.01);
+        modelGroup.add(headband);
+      }
+    }
+
+
+    // ==========================================
+    // 7. ACCESSORIES (Wings, Necklaces, Glasses)
+    // ==========================================
+    const accItem = items.accessories;
+    if (accItem.visible && accItem.style !== 'none') {
+      const aMat = makeClotheMat(accItem);
+      const aAccent = makeAccentMat(accItem);
+
+      if (accItem.style === 'glasses') {
+        // Frame wire structures centered on head coordinates
+        const frameGeo = new THREE.TorusGeometry(0.046 * scaleX, 0.008, 6, 16);
+        const glassMat = new THREE.MeshStandardMaterial({ color: 0x1e293b, metalness: 0.3, roughness: 0.2 });
+
+        const lFrame = new THREE.Mesh(frameGeo, glassMat);
+        lFrame.position.set(-0.07 * scaleX, headY - 0.01, 0.22 * scaleX);
+        modelGroup.add(lFrame);
+
+        const rFrame = new THREE.Mesh(frameGeo, glassMat);
+        rFrame.position.set(0.07 * scaleX, headY - 0.01, 0.22 * scaleX);
+        modelGroup.add(rFrame);
+
+        // Center nose-bridge segment
+        const bridgeGeo = new THREE.CylinderGeometry(0.006, 0.006, 0.05 * scaleX, 8);
+        const bridge = new THREE.Mesh(bridgeGeo, glassMat);
+        bridge.rotation.z = Math.PI / 2;
+        bridge.position.set(0, headY - 0.01, 0.221 * scaleX);
+        modelGroup.add(bridge);
+
+      } else if (accItem.style === 'scarf') {
+        // Thick cozy wrap ring around neck
+        const scarfGeo = new THREE.TorusGeometry(0.09 * scaleX, 0.038, 12, 24);
+        const mainWreath = new THREE.Mesh(scarfGeo, aMat);
+        mainWreath.rotation.x = Math.PI / 2;
+        mainWreath.position.set(0, neckY, 0);
+        mainWreath.castShadow = true;
+        modelGroup.add(mainWreath);
+
+        // Tail wrap draping down front chest chest
+        const scarfTailGeo = new THREE.BoxGeometry(0.06 * scaleX, 0.3 * scaleY, 0.03 * scaleX);
+        const tail = new THREE.Mesh(scarfTailGeo, aAccent);
+        tail.position.set(0.06 * scaleX, neckY - 0.15 * scaleY, 0.21 * scaleX);
+        tail.rotation.z = -0.12;
+        tail.rotation.y = 0.1;
+        tail.castShadow = true;
+        modelGroup.add(tail);
+
+      } else if (accItem.style === 'necklace') {
+        // Slim gold necklace chain loop
+        const chainGeo = new THREE.TorusGeometry(0.095 * scaleX, 0.006, 8, 24);
+        const goldRoyalMat = new THREE.MeshStandardMaterial({ color: 0xeab308, metalness: 0.9, roughness: 0.15 });
+        const chain = new THREE.Mesh(chainGeo, goldRoyalMat);
+        chain.rotation.x = Math.PI / 1.7; // resting on chests collar
+        chain.position.set(0, neckY - 0.05 * scaleY, 0.02 * scaleX);
+        modelGroup.add(chain);
+
+        // Crystal gem pendant
+        const gemGeo = new THREE.ConeGeometry(0.018 * scaleX, 0.035, 4);
+        const gemMat = new THREE.MeshStandardMaterial({ color: new THREE.Color(accItem.color.primary), metalness: 0.7, roughness: 0.05 });
+        const gem = new THREE.Mesh(gemGeo, gemMat);
+        gem.position.set(0, neckY - 0.12 * scaleY, 0.13 * scaleX);
+        gem.rotation.x = 0.2;
+        modelGroup.add(gem);
+
+      } else if (accItem.style === 'wings') {
+        // Symmetrical magnificent feathered wing planes extending behind the back!
+        const wingLGeo = new THREE.BoxGeometry(0.85 * scaleX, 0.25 * scaleY, 0.015 * scaleX);
+        
+        // Left Wing (angled elegantly out and back)
+        const wingL = new THREE.Mesh(wingLGeo, aMat);
+        wingL.position.set(-0.48 * scaleX, chestY + 0.1 * scaleY, -0.15 * scaleX);
+        wingL.rotation.y = 0.35; // angled backwards
+        wingL.rotation.z = 0.25; // elegant raised wing posture
+        wingL.castShadow = true;
+        modelGroup.add(wingL);
+
+        // Inner layered feathers Left
+        const innerWingLGeo = new THREE.BoxGeometry(0.65 * scaleX, 0.18 * scaleY, 0.012 * scaleX);
+        const innerWingL = new THREE.Mesh(innerWingLGeo, aAccent);
+        innerWingL.position.set(-0.4 * scaleX, chestY + 0.1 * scaleY, -0.13 * scaleX);
+        innerWingL.rotation.y = 0.35;
+        innerWingL.rotation.z = 0.25;
+        modelGroup.add(innerWingL);
+
+        // Right Wing (Perfect symmetrical mirror)
+        const wingR = new THREE.Mesh(wingLGeo, aMat);
+        wingR.position.set(0.48 * scaleX, chestY + 0.1 * scaleY, -0.15 * scaleX);
+        wingR.rotation.y = -0.35;
+        wingR.rotation.z = -0.25;
+        wingR.castShadow = true;
+        modelGroup.add(wingR);
+
+        const innerWingR = new THREE.Mesh(innerWingLGeo, aAccent);
+        innerWingR.position.set(0.4 * scaleX, chestY + 0.1 * scaleY, -0.13 * scaleX);
+        innerWingR.rotation.y = -0.35;
+        innerWingR.rotation.z = -0.25;
+        modelGroup.add(innerWingR);
+
+      } else if (accItem.style === 'satchel') {
+        // Crossbody diagonal cylinder belt strap
+        const satchelFit = 0.01;
+        const strapGeo = new THREE.TorusGeometry((0.21 + satchelFit) * scaleX, 0.012, 8, 32, Math.PI * 1.5);
+        const strap = new THREE.Mesh(strapGeo, aMat);
+        strap.rotation.y = Math.PI / 2;
+        strap.rotation.z = 0.65; // diagonal crossbody tilt
+        strap.position.set(0, chestY + 0.05 * scaleY, 0);
+        modelGroup.add(strap);
+
+        // Leather hip storage pack box
+        const pouchGeo = new THREE.BoxGeometry(0.06 * scaleX, 0.15 * scaleY, 0.12 * scaleX);
+        const pouch = new THREE.Mesh(pouchGeo, aAccent);
+        pouch.position.set(0.2 * scaleX, pelvisY - 0.02 * scaleY, 0.08 * scaleX);
+        pouch.rotation.z = -0.15;
+        pouch.rotation.y = 0.45;
+        pouch.castShadow = true;
+        modelGroup.add(pouch);
+      }
+    }
+
+    // Symmetrical and robust floor auto-alignment math
+    const currentFootYPos = actualAnkleY - 0.02 * scaleY;
+    let lowestY = actualAnkleY - 0.05 * scaleY; // default bare feet bottom
+    if (footItem.visible) {
+      if (footItem.style === 'sneakers') {
+        lowestY = currentFootYPos - 0.065 * scaleY;
+      } else if (footItem.style === 'boots') {
+        lowestY = currentFootYPos - 0.0825 * scaleY;
+      } else if (footItem.style === 'sandals') {
+        lowestY = currentFootYPos - 0.05 * scaleY;
+      } else if (footItem.style === 'dress_shoes') {
+        lowestY = currentFootYPos - 0.03 * scaleY;
+      }
+    }
+
+    // Vertically translate the entire mannequin structure so its feet/shoes rest flat on the floor level (y = -1.13)
+    modelGroup.position.y = -1.13 - lowestY;
+
+  }, [items, body, sceneReady]);
+
+  // Utility helpers to scale coordinates correctly
+  const scaleZOffset = (sx: number) => {
+    return Math.max(0.65, Math.min(1.35, sx));
   };
 
   return (
-    <div className="relative w-full h-[520px] rounded-2xl bg-gradient-to-b from-slate-50 to-slate-100 flex items-center justify-center p-4 shadow-inner border border-slate-200 overflow-hidden">
-      {/* Background Grid Pattern Decors */}
-      <div className="absolute inset-0 bg-[linear-gradient(to_right,#cbd5e120_1px,transparent_1px),linear-gradient(to_bottom,#cbd5e120_1px,transparent_1px)] bg-[size:16px_16px] pointer-events-none" />
-
-      {/* Shadow floor */}
-      <div className="absolute bottom-6 w-32 h-4 bg-slate-900/10 rounded-full blur-sm" />
-
-      {/* Core SVG Workspace */}
-      <svg
-        id="mannequin-canvas"
-        viewBox="0 0 400 500"
-        className="w-full h-full max-w-[380px] drop-shadow-xl transition-all duration-500 ease-out"
-        style={getZoomStyle()}
-      >
-        <defs>
-          {/* STRIPES HORIZONTAL */}
-          <pattern id="pat-stripes-h" width="20" height="20" patternUnits="userSpaceOnUse">
-            <line x1="0" y1="10" x2="20" y2="10" stroke="#000000" strokeWidth="6" strokeLinecap="square" />
-          </pattern>
-
-          {/* STRIPES VERTICAL */}
-          <pattern id="pat-stripes-v" width="20" height="20" patternUnits="userSpaceOnUse">
-            <line x1="10" y1="0" x2="10" y2="20" stroke="#000000" strokeWidth="6" strokeLinecap="square" />
-          </pattern>
-
-          {/* POLKA DOTS */}
-          <pattern id="pat-dots" width="24" height="24" patternUnits="userSpaceOnUse">
-            <circle cx="12" cy="12" r="5" fill="#000000" />
-          </pattern>
-
-          {/* CHECKERBOARD */}
-          <pattern id="pat-checkerboard" width="30" height="30" patternUnits="userSpaceOnUse">
-            <rect width="15" height="15" fill="#000000" />
-            <rect x="15" y="15" width="15" height="15" fill="#000000" />
-          </pattern>
-
-          {/* STARS */}
-          <pattern id="pat-stars" width="40" height="40" patternUnits="userSpaceOnUse">
-            <path d="M 20 8 L 24 16 L 33 17 L 26 23 L 28 32 L 20 27 L 12 32 L 14 23 L 7 17 L 16 16 Z" fill="#000000" transform="scale(0.65) translate(10, 10)" />
-          </pattern>
-
-          {/* Flat shadow values */}
-          <filter id="shadow" x="-10%" y="-10%" width="120%" height="120%">
-            <feDropShadow dx="0" dy="3" stdDeviation="3" floodOpacity="0.1" />
-          </filter>
-        </defs>
-
-        {/* ===================================================================== */}
-        {/* CHARACTER / MANNEQUIN CORE GROUP                                     */}
-        {/* ===================================================================== */}
-        <g transform={`translate(${200 - 200 * bodyScaleX}, ${230 - 230 * bodyScaleY}) scale(${bodyScaleX}, ${bodyScaleY})`}>
-          
-          {/* --- BASE BODY / SKIN LAYER --- */}
-          {/* Back Hair Layer (For long waves style) */}
-          {items.hair.visible && items.hair.style === 'waves' && (
-            <path
-              d="M 155 100 C 130 140 125 210 145 250 C 145 230 160 170 180 140 Z M 245 100 C 270 140 275 210 255 250 C 255 230 240 170 220 140 Z"
-              fill={items.hair.color.primary}
-            />
-          )}
-
-          {/* Left Wing Accessory (Rendered behind body) */}
-          {items.accessories.visible && items.accessories.style === 'wings' && (
-            <g opacity="0.9" filter="url(#shadow)">
-              {/* Outer feathered wing Left */}
-              <path
-                d="M 160 160 C 80 100 20 160 40 240 C 60 210 110 200 160 185 Z"
-                fill={items.accessories.color.primary}
-              />
-              <path
-                d="M 150 175 C 90 135 45 180 60 230 C 80 210 120 205 150 195 Z"
-                fill={items.accessories.color.secondary}
-              />
-              {/* Right Wing */}
-              <path
-                d="M 240 160 C 320 100 380 160 360 240 C 340 210 290 200 240 185 Z"
-                fill={items.accessories.color.primary}
-              />
-              <path
-                d="M 250 175 C 310 135 355 180 340 230 C 320 210 280 205 250 195 Z"
-                fill={items.accessories.color.secondary}
-              />
-            </g>
-          )}
-
-          {/* Ears */}
-          <circle cx="170" cy="90" r="7" fill={skinColor} />
-          <circle cx="230" cy="90" r="7" fill={skinColor} />
-          {/* Ear shadow details */}
-          <circle cx="171" cy="90" r="4" fill={shadowSkinColor} />
-          <circle cx="229" cy="90" r="4" fill={shadowSkinColor} />
-
-          {/* Neck */}
-          <path d="M 188 112 L 212 112 L 210 137 L 190 137 Z" fill={skinColor} />
-          <path d="M 188 112 L 212 112 L 210 121 L 190 121 Z" fill={shadowSkinColor} /> {/* neck shadow */}
-
-          {/* Arms (Base) */}
-          {/* L Arm */}
-          <path d="M 155 140 C 130 180 120 220 120 260 C 120 270 128 270 132 260 C 138 220 148 180 168 140 Z" fill={skinColor} />
-          {/* R Arm */}
-          <path d="M 245 140 C 270 180 280 220 280 260 C 280 270 272 270 268 260 C 262 220 252 180 232 140 Z" fill={skinColor} />
-          
-          {/* Torso & Hip Base */}
-          <path d="M 155 135 L 245 135 L 235 240 L 165 240 Z" fill={skinColor} />
-          <path d="M 165 240 L 235 240 L 240 285 L 160 285 Z" fill={skinColor} stroke={shadowSkinColor} strokeWidth="1" />
-
-          {/* Leg Base */}
-          {/* L Leg */}
-          <path d="M 160 280 L 195 280 C 190 330 182 380 180 430 L 160 430 C 163 380 165 330 160 280 Z" fill={skinColor} />
-          {/* R Leg */}
-          <path d="M 205 280 L 240 280 C 237 330 235 380 220 430 L 240 430 C 235 380 225 330 205 280 Z" fill={skinColor} />
-
-          {/* Hands */}
-          <circle cx="123" cy="264" r="8" fill={skinColor} />
-          <circle cx="277" cy="264" r="8" fill={skinColor} />
-
-          {/* --- FACE DETAILS --- */}
-          <g>
-            {/* Blushing cheeks */}
-            <ellipse cx="183" cy="98" rx="5" ry="3" fill={blushColor} opacity="0.6" />
-            <ellipse cx="217" cy="98" rx="5" ry="3" fill={blushColor} opacity="0.6" />
-            {/* Cute sleeping eyes */}
-            <path d="M 180 92 Q 185 96 190 92" fill="none" stroke="#2D3748" strokeWidth="2.5" strokeLinecap="round" />
-            <path d="M 210 92 Q 215 96 220 92" fill="none" stroke="#2D3748" strokeWidth="2.5" strokeLinecap="round" />
-            {/* Smile */}
-            <path d="M 197 101 Q 200 105 203 101" fill="none" stroke="#2D3748" strokeWidth="2.5" strokeLinecap="round" />
-          </g>
-
-          {/* Head Sphere (Placed above ears/neck but behind hair & specs) */}
-          <path d="M 170 90 C 170 54 230 54 230 90 C 230 115 170 115 170 90 Z" fill={skinColor} />
-
-          {/* Underwear (Standard default so it's not empty) */}
-          <path d="M 165 145 H 235 V 170 H 165 Z" fill="#4B5563" opacity="0.8" /> {/* default tube top */}
-          <path d="M 160 268 H 240 L 230 285 H 170 Z" fill="#4B5563" opacity="0.8" /> {/* default briefs */}
-
-          {/* ===================================================================== */}
-          {/* TOPS LAYER                                                           */}
-          {/* ===================================================================== */}
-          {items.top.visible && (
-            <g filter="url(#shadow)">
-              {/* T-SHIRT */}
-              {items.top.style === 'tshirt' && (
-                <>
-                  {/* Chest & Torso */}
-                  <path id="top-tshirt-body" d="M 153 135 H 247 L 237 230 H 163 Z" fill={items.top.color.primary} />
-                  {/* Stripes, dot, etc patterns for Main chest */}
-                  {renderPatternMask(items.top, "M 153 135 H 247 L 237 230 H 163 Z")}
-
-                  {/* Collar details */}
-                  <path d="M 185 135 C 185 148 215 148 215 135 Z" fill={items.top.color.secondary} />
-
-                  {/* Left Sleeve */}
-                  <path d="M 155 135 L 135 175 L 148 181 L 168 145 Z" fill={items.top.color.primary} />
-                  {/* Right Sleeve */}
-                  <path d="M 245 135 L 265 175 L 252 181 L 232 145 Z" fill={items.top.color.primary} />
-                </>
-              )}
-
-              {/* HOODIE */}
-              {items.top.style === 'hoodie' && (
-                <>
-                  {/* Main Pullover */}
-                  <path id="top-hoodie-body" d="M 150 135 H 250 L 240 245 H 160 Z" fill={items.top.color.primary} />
-                  {renderPatternMask(items.top, "M 150 135 H 250 L 240 245 H 160 Z")}
-
-                  {/* Kangaroo Hand Pocket */}
-                  <path d="M 175 195 H 225 L 220 235 H 180 Z" fill={items.top.color.secondary} />
-                  {/* Kangaroo Pocket Openings */}
-                  <circle cx="181" cy="215" r="4" fill={items.top.color.accent} />
-                  <circle cx="219" cy="215" r="4" fill={items.top.color.accent} />
-
-                  {/* Bulky Sleeves */}
-                  {/* L Slv */}
-                  <path d="M 155 135 L 122 235 L 138 240 L 168 150 Z" fill={items.top.color.primary} />
-                  <rect x="122" y="235" width="16" height="5" rx="2" fill={items.top.color.secondary} transform="rotate(-15, 122, 235)" />
-                  {/* R Slv */}
-                  <path d="M 245 135 L 278 235 L 262 240 L 232 150 Z" fill={items.top.color.primary} />
-                  <rect x="262" y="240" width="16" height="5" rx="2" fill={items.top.color.secondary} transform="rotate(15, 262, 240)" />
-
-                  {/* Cozy Hood behind/around neckline */}
-                  <path d="M 175 135 C 175 110 225 110 225 135 C 225 145 175 145 175 135 Z" fill={items.top.color.secondary} />
-                  {/* Strings */}
-                  <line x1="190" y1="135" x2="190" y2="165" stroke={items.top.color.accent} strokeWidth="3" strokeLinecap="round" />
-                  <line x1="210" y1="135" x2="210" y2="165" stroke={items.top.color.accent} strokeWidth="3" strokeLinecap="round" />
-                </>
-              )}
-
-              {/* SWEATER */}
-              {items.top.style === 'sweater' && (
-                <>
-                  {/* Torso */}
-                  <path id="top-sweater-body" d="M 152 135 H 248 L 236 235 H 164 Z" fill={items.top.color.primary} />
-                  {renderPatternMask(items.top, "M 152 135 H 248 L 236 235 H 164 Z")}
-
-                  {/* Ribbed Hem & Neckline */}
-                  <path d="M 164 228 H 236 V 235 H 164 Z" fill={items.top.color.secondary} />
-                  <path d="M 183 135 H 217 V 144 H 183 Z" fill={items.top.color.secondary} />
-
-                  {/* Sleeves */}
-                  <path d="M 154 135 L 123 245 L 137 248 L 166 148 Z" fill={items.top.color.primary} />
-                  <path d="M 246 135 L 277 245 L 263 248 L 234 148 Z" fill={items.top.color.primary} />
-                  {/* Ribbed Cuffs */}
-                  <rect x="121" y="243" width="14" height="6" rx="1" fill={items.top.color.secondary} transform="rotate(-15, 121, 243)" />
-                  <rect x="264" y="243" width="14" height="6" rx="1" fill={items.top.color.secondary} transform="rotate(15, 264, 243)" />
-                </>
-              )}
-
-              {/* CROP TOP */}
-              {items.top.style === 'croptop' && (
-                <>
-                  <path id="top-crop-body" d="M 154 135 H 246 L 240 185 H 160 Z" fill={items.top.color.primary} />
-                  {renderPatternMask(items.top, "M 154 135 H 246 L 240 185 H 160 Z")}
-
-                  {/* Strap/Sleeves */}
-                  <path d="M 154 135 L 140 160 L 150 165 L 162 142 Z" fill={items.top.color.secondary} />
-                  <path d="M 246 135 L 260 160 L 250 165 L 238 142 Z" fill={items.top.color.secondary} />
-                </>
-              )}
-
-              {/* TANK TOP */}
-              {items.top.style === 'tanktop' && (
-                <>
-                  <path id="top-tank-body" d="M 162 135 H 238 L 234 220 H 166 Z" fill={items.top.color.primary} />
-                  {renderPatternMask(items.top, "M 162 135 H 238 L 234 220 H 166 Z")}
-
-                  {/* Deep neck curve */}
-                  <path d="M 180 135 C 180 152 220 152 220 135 Z" fill={skinColor} />
-                  {/* Trim bindings */}
-                  <path d="M 162 135 H 178 V 142 H 162 Z" fill={items.top.color.accent} />
-                  <path d="M 222 135 H 238 V 142 H 222 Z" fill={items.top.color.accent} />
-                </>
-              )}
-
-              {/* BLAZER / SUIT JACKET */}
-              {items.top.style === 'blazer' && (
-                <>
-                  {/* Inside Shirt & Tie */}
-                  <path d="M 178 135 L 222 135 L 200 185 Z" fill="#F8FAFC" />
-                  <path d="M 197 142 L 203 142 L 205 175 L 200 182 L 195 175 Z" fill={items.top.color.accent} /> {/* Tie */}
-
-                  {/* Main Blazer Outline */}
-                  <path d="M 150 135 H 178 L 195 210 L 200 240 L 205 210 L 222 135 H 250 L 240 240 H 160 Z" fill={items.top.color.primary} />
-                  {/* Collar Lapels */}
-                  <path d="M 150 135 L 175 185 L 188 185 L 178 135 Z" fill={items.top.color.secondary} />
-                  <path d="M 250 135 L 225 185 L 212 185 L 222 135 Z" fill={items.top.color.secondary} />
-
-                  {/* Golden Single Button */}
-                  <circle cx="200" cy="210" r="3.5" fill="#EAB308" />
-
-                  {/* Tailored Sleeves */}
-                  <path d="M 154 135 L 124 245 L 138 248 L 166 148 Z" fill={items.top.color.primary} />
-                  <path d="M 246 135 L 276 245 L 262 248 L 234 148 Z" fill={items.top.color.primary} />
-                  {/* Wrist detail cuffs */}
-                  <path d="M 124 240 L 134 243 H 138 L 128 240 Z" fill={items.top.color.secondary} stroke={items.top.color.primary} strokeWidth="1" />
-                </>
-              )}
-            </g>
-          )}
-
-          {/* ===================================================================== */}
-          {/* BOTTOMS LAYER                                                        */}
-          {/* ===================================================================== */}
-          {items.bottom.visible && (
-            <g filter="url(#shadow)">
-              {/* JEANS */}
-              {items.bottom.style === 'jeans' && (
-                <>
-                  {/* Pants Hip & Legs */}
-                  <path id="bottom-jeans" d="M 160 235 H 240 L 238 280 C 238 310 231 360 228 420 H 204 C 204 360 202 310 200 285 C 198 310 196 360 196 420 H 172 C 169 360 162 310 162 280 Z" fill={items.bottom.color.primary} />
-                  {renderPatternMask(items.bottom, "M 160 235 H 240 L 238 280 C 238 310 231 360 228 420 H 204 C 204 360 202 310 200 285 C 198 310 196 360 196 420 H 172 C 169 360 162 310 162 280 Z")}
-
-                  {/* Belt loops & pockets stitches */}
-                  <path d="M 160 235 H 240 V 246 H 160 Z" fill={items.bottom.color.secondary} opacity="0.9" />
-                  <line x1="160" y1="246" x2="240" y2="246" stroke={items.bottom.color.accent} strokeWidth="1.5" strokeDasharray="3 2" />
-                  {/* Pockets */}
-                  <path d="M 165 246 Q 170 262 178 259" fill="none" stroke={items.bottom.color.accent} strokeWidth="1.5" />
-                  <path d="M 235 246 Q 230 262 222 259" fill="none" stroke={items.bottom.color.accent} strokeWidth="1.5" />
-                </>
-              )}
-
-              {/* SHORTS */}
-              {items.bottom.style === 'shorts' && (
-                <>
-                  <path id="bottom-shorts" d="M 160 235 H 240 L 244 320 H 205 L 200 275 L 195 320 H 156 Z" fill={items.bottom.color.primary} />
-                  {renderPatternMask(items.bottom, "M 160 235 H 240 L 244 320 H 205 L 200 275 L 195 320 H 156 Z")}
-
-                  {/* Drawstring or belt */}
-                  <path d="M 160 235 H 240 V 244 H 160 Z" fill={items.bottom.color.secondary} />
-                  <circle cx="200" cy="240" r="3.5" fill={items.bottom.color.accent} />
-                  {/* Small loose ribbons hanging */}
-                  <path d="M 198 240 Q 192 255 194 262" fill="none" stroke={items.bottom.color.accent} strokeWidth="2.5" />
-                  <path d="M 202 240 Q 208 255 206 262" fill="none" stroke={items.bottom.color.accent} strokeWidth="2.5" />
-                </>
-              )}
-
-              {/* PLEATED SKIRT */}
-              {items.bottom.style === 'skirt' && (
-                <>
-                  <path id="bottom-skirt" d="M 165 235 H 235 L 255 330 H 145 Z" fill={items.bottom.color.primary} />
-                  {renderPatternMask(items.bottom, "M 165 235 H 235 L 255 330 H 145 Z")}
-
-                  {/* Waistband */}
-                  <path d="M 165 235 H 235 V 246 H 165 Z" fill={items.bottom.color.secondary} />
-                  {/* Pleat lines */}
-                  <g stroke={items.bottom.color.accent} strokeWidth="2" opacity="0.6">
-                    <line x1="180" y1="246" x2="165" y2="330" />
-                    <line x1="193" y1="246" x2="185" y2="330" />
-                    <line x1="207" y1="246" x2="215" y2="330" />
-                    <line x1="220" y1="246" x2="235" y2="330" />
-                  </g>
-                </>
-              )}
-
-              {/* CARGO PANTS */}
-              {items.bottom.style === 'cargo' && (
-                <>
-                  {/* Heavy legs with folded creases */}
-                  <path id="bottom-cargo" d="M 158 235 H 242 L 244 280 C 244 310 236 350 232 420 H 205 C 205 365 203 310 200 288 C 197 310 195 365 195 420 H 168 C 164 350 156 310 156 280 Z" fill={items.bottom.color.primary} />
-                  {renderPatternMask(items.bottom, "M 158 235 H 242 L 244 280 C 244 310 236 350 232 420 H 205 C 205 365 203 310 200 288 C 197 310 195 365 195 420 H 168 C 164 350 156 310 156 280 Z")}
-
-                  {/* Bulky Side Pockets */}
-                  <path d="M 154 300 H 163 V 335 H 154 Z" fill={items.bottom.color.secondary} />
-                  <path d="M 237 300 H 246 V 335 H 237 Z" fill={items.bottom.color.secondary} />
-                  {/* Pocket Flaps */}
-                  <path d="M 153 298 H 164 V 306 H 153 Z" fill={items.bottom.color.accent} />
-                  <path d="M 236 298 H 247 V 306 H 236 Z" fill={items.bottom.color.accent} />
-
-                  {/* Elastic waistband */}
-                  <path d="M 158 235 H 242 V 246 H 158 Z" fill={items.bottom.color.secondary} />
-                </>
-              )}
-
-              {/* COZY JOGGERS */}
-              {items.bottom.style === 'joggers' && (
-                <>
-                  <path id="bottom-joggers" d="M 159 235 H 241 L 241 280 C 241 310 232 360 226 414 H 210 C 208 385 203 310 200 286 C 197 310 192 385 190 414 H 174 C 168 360 159 310 159 280 Z" fill={items.bottom.color.primary} />
-                  {renderPatternMask(items.bottom, "M 159 235 H 241 L 241 280 C 241 310 232 360 226 414 H 210 C 208 385 203 310 200 286 C 197 310 192 385 190 414 H 174 C 168 360 159 310 159 280 Z")}
-
-                  {/* Cuff Ankles */}
-                  <rect x="174" y="414" width="16" height="7" rx="2.2" fill={items.bottom.color.secondary} />
-                  <rect x="210" y="414" width="16" height="7" rx="2.2" fill={items.bottom.color.secondary} />
-
-                  {/* Slanted stylish stripes on the leg sides */}
-                  <path d="M 160 260 L 162 310" stroke={items.bottom.color.accent} strokeWidth="3.5" strokeLinecap="round" />
-                  <path d="M 240 260 L 238 310" stroke={items.bottom.color.accent} strokeWidth="3.5" strokeLinecap="round" />
-                </>
-              )}
-            </g>
-          )}
-
-          {/* ===================================================================== */}
-          {/* FOOTWEAR LAYER                                                       */}
-          {/* ===================================================================== */}
-          {items.footwear.visible && (
-            <g filter="url(#shadow)">
-              {/* SNEAKERS */}
-              {items.footwear.style === 'sneakers' && (
-                <>
-                  {/* Left Sneaker */}
-                  <g>
-                    {/* Foot Core */}
-                    <path d="M 160 418 H 182 L 186 438 H 152 Z" fill={items.footwear.color.primary} />
-                    {/* White Platform Sole */}
-                    <path d="M 150 435 H 188 V 441 H 150 Z" fill="#FFFFFF" />
-                    {/* Sneakers details */}
-                    <path d="M 165 418 C 165 425 180 430 180 435 Z" fill={items.footwear.color.secondary} opacity="0.8" />
-                    {/* Laces */}
-                    <line x1="164" y1="422" x2="174" y2="422" stroke={items.footwear.color.accent} strokeWidth="2.5" />
-                    <line x1="166" y1="428" x2="176" y2="428" stroke={items.footwear.color.accent} strokeWidth="2.5" />
-                  </g>
-                  {/* Right Sneaker */}
-                  <g>
-                    <path d="M 218 418 H 240 L 248 438 H 214 Z" fill={items.footwear.color.primary} />
-                    <path d="M 212 435 H 250 V 441 H 212 Z" fill="#FFFFFF" />
-                    <path d="M 235 418 C 235 425 220 430 220 435 Z" fill={items.footwear.color.secondary} opacity="0.8" />
-                    <line x1="226" y1="422" x2="236" y2="422" stroke={items.footwear.color.accent} strokeWidth="2.5" />
-                    <line x1="224" y1="428" x2="234" y2="428" stroke={items.footwear.color.accent} strokeWidth="2.5" />
-                  </g>
-                </>
-              )}
-
-              {/* HEAVY BOOTS */}
-              {items.footwear.style === 'boots' && (
-                <>
-                  {/* Left Boot */}
-                  <g>
-                    {/* Ankle wrap up */}
-                    <rect x="156" y="405" width="26" height="24" rx="2" fill={items.footwear.color.secondary} />
-                    {/* Boot foot */}
-                    <path d="M 152 422 H 184 L 188 440 H 146 Z" fill={items.footwear.color.primary} />
-                    {/* Sole grip */}
-                    <path d="M 144 438 H 190 V 444 H 144 Z" fill={items.footwear.color.accent} />
-                  </g>
-                  {/* Right Boot */}
-                  <g>
-                    <rect x="218" y="405" width="26" height="24" rx="2" fill={items.footwear.color.secondary} />
-                    <path d="M 216 422 H 248 L 254 440 H 212 Z" fill={items.footwear.color.primary} />
-                    <path d="M 210 438 H 256 V 444 H 210 Z" fill={items.footwear.color.accent} />
-                  </g>
-                </>
-              )}
-
-              {/* SANDALS */}
-              {items.footwear.style === 'sandals' && (
-                <>
-                  {/* Left Sandal */}
-                  <g>
-                    <path d="M 152 436 H 188 V 441 H 152 Z" fill={items.footwear.color.primary} />
-                    {/* Straps overlay on skin */}
-                    <path d="M 158 420 C 162 420 166 430 168 436" fill="none" stroke={items.footwear.color.secondary} strokeWidth="3" />
-                    <path d="M 174 420 C 170 420 168 430 168 436" fill="none" stroke={items.footwear.color.secondary} strokeWidth="3" />
-                  </g>
-                  {/* Right Sandal */}
-                  <g>
-                    <path d="M 212 436 H 248 V 441 H 212 Z" fill={items.footwear.color.primary} />
-                    <path d="M 226 420 C 230 420 232 430 232 436" fill="none" stroke={items.footwear.color.secondary} strokeWidth="3" />
-                    <path d="M 242 420 C 238 420 234 430 232 436" fill="none" stroke={items.footwear.color.secondary} strokeWidth="3" />
-                  </g>
-                </>
-              )}
-
-              {/* DRESS SHOES / LOAFERS */}
-              {items.footwear.style === 'dress_shoes' && (
-                <>
-                  {/* Left Dress Shoe */}
-                  <g>
-                    <path d="M 154 420 Q 170 415 186 422 L 188 438 H 150 Z" fill={items.footwear.color.primary} />
-                    <path d="M 148 436 H 190 V 440 H 148 Z" fill={items.footwear.color.secondary} />
-                    {/* Shiny accent buckle */}
-                    <circle cx="168" cy="425" r="2.5" fill={items.footwear.color.accent} />
-                  </g>
-                  {/* Right Dress Shoe */}
-                  <g>
-                    <path d="M 214 420 Q 230 415 246 422 L 250 438 H 210 Z" fill={items.footwear.color.primary} />
-                    <path d="M 208 436 H 252 V 440 H 208 Z" fill={items.footwear.color.secondary} />
-                    <circle cx="232" cy="425" r="2.5" fill={items.footwear.color.accent} />
-                  </g>
-                </>
-              )}
-            </g>
-          )}
-
-          {/* ===================================================================== */}
-          {/* HAIR CONFIG                                                          */}
-          {/* ===================================================================== */}
-          {items.hair.visible && (
-            <g filter="url(#shadow)">
-              {/* SHORT CROP */}
-              {items.hair.style === 'crop' && (
-                <path
-                  d="M 166 84 C 160 55 240 55 234 84 C 234 70 215 65 200 65 C 185 65 166 70 166 84 Z"
-                  fill={items.hair.color.primary}
-                />
-              )}
-
-              {/* LONG WAVY HAIR (Front overlays on shoulders) */}
-              {items.hair.style === 'waves' && (
-                <>
-                  {/* Wave Fringe & Locks overlaying front shoulder */}
-                  <path
-                    d="M 170 85 C 168 50 232 50 230 85 C 220 70 180 70 170 85 Z"
-                    fill={items.hair.color.primary}
-                  />
-                  {/* Hanging curls and locks */}
-                  <path
-                    d="M 170 85 Q 155 110 160 145 Q 165 170 155 195 Q 168 180 175 145 Z"
-                    fill={items.hair.color.secondary}
-                  />
-                  <path
-                    d="M 230 85 Q 245 110 240 145 Q 235 170 245 195 Q 232 180 225 145 Z"
-                    fill={items.hair.color.secondary}
-                  />
-                </>
-              )}
-
-              {/* CLASSIC BOB */}
-              {items.hair.style === 'bob' && (
-                <path
-                  d="M 164 100 C 158 50 242 50 236 100 Q 236 115 226 115 Q 174 115 164 100 Z"
-                  fill={items.hair.color.primary}
-                />
-              )}
-
-              {/* SPIKY MOHAWK */}
-              {items.hair.style === 'mohawk' && (
-                <path
-                  d="M 194 62 L 206 62 L 208 42 L 202 50 L 198 40 L 196 50 Z M 196 75 L 204 75 L 205 58 L 200 62 L 195 58 Z"
-                  fill={items.hair.color.primary}
-                />
-              )}
-
-              {/* ELEGANT BUN */}
-              {items.hair.style === 'bun' && (
-                <>
-                  {/* Bun Sphere on top of crown */}
-                  <circle cx="200" cy="50" r="14" fill={items.hair.color.secondary} />
-                  {/* Head wrap */}
-                  <path
-                    d="M 170 85 C 170 55 230 55 230 85 Z"
-                    fill={items.hair.color.primary}
-                  />
-                </>
-              )}
-
-              {/* MODERN BRAIDS */}
-              {items.hair.style === 'braids' && (
-                <>
-                  <path d="M 170 85 C 170 56 230 56 230 85 Z" fill={items.hair.color.primary} />
-                  {/* Braids drooping Left */}
-                  <path d="M 170 85 C 160 110 155 160 150 210 V 222 H 158 V 210 Q 165 140 174 110 Z" fill={items.hair.color.primary} />
-                  <circle cx="154" cy="218" r="4.5" fill={items.hair.color.accent} />
-                  {/* Braids drooping Right */}
-                  <path d="M 230 85 C 240 110 245 160 250 210 V 222 H 242 V 210 Q 235 140 226 110 Z" fill={items.hair.color.primary} />
-                  <circle cx="246" cy="218" r="4.5" fill={items.hair.color.accent} />
-                </>
-              )}
-            </g>
-          )}
-
-          {/* ===================================================================== */}
-          {/* HEADWEAR LAYER                                                       */}
-          {/* ===================================================================== */}
-          {items.headwear.visible && (
-            <g filter="url(#shadow)">
-              {/* BASEBALL CAP */}
-              {items.headwear.style === 'cap' && (
-                <>
-                  {/* Dome */}
-                  <path d="M 170 80 C 170 44 230 44 230 80 H 170 Z" fill={items.headwear.color.primary} />
-                  {/* Ribbon/Strap details */}
-                  <path d="M 170 76 H 230 V 82 H 170 Z" fill={items.headwear.color.secondary} />
-                  {/* Cap Beak/Visor */}
-                  <path d="M 172 80 H 228 C 242 80 242 92 224 92 H 176 C 158 92 158 80 172 80 Z" fill={items.headwear.color.accent} />
-                </>
-              )}
-
-              {/* ACY RIBS BEANIE */}
-              {items.headwear.style === 'beanie' && (
-                <>
-                  {/* Slouched dome */}
-                  <path d="M 166 84 C 162 48 238 48 234 84 Z" fill={items.headwear.color.primary} />
-                  {/* Ribbed roll */}
-                  <rect x="164" y="78" width="72" height="12" rx="4" fill={items.headwear.color.secondary} />
-                  {/* Beanie Pom-Pom ball on top */}
-                  <circle cx="200" cy="46" r="6.5" fill={items.headwear.color.accent} />
-                </>
-              )}
-
-              {/* SUMMER SUNHAT */}
-              {items.headwear.style === 'sunhat' && (
-                <>
-                  {/* Crown */}
-                  <path d="M 174 76 C 174 48 226 48 226 76 Z" fill={items.headwear.color.primary} />
-                  {/* Ribbon strap */}
-                  <path d="M 174 72 H 226 V 78 H 174 Z" fill={items.headwear.color.accent} />
-                  {/* Big Floppy Brim ellipse hat */}
-                  <ellipse cx="200" cy="78" rx="55" ry="10" fill={items.headwear.color.secondary} stroke={items.headwear.color.primary} strokeWidth="1" />
-                </>
-              )}
-
-              {/* GOLDEN ROYAL CROWN */}
-              {items.headwear.style === 'crown' && (
-                <>
-                  {/* Tri-peak crown */}
-                  <path d="M 174 80 L 170 60 L 188 72 L 200 52 L 212 72 L 230 60 L 226 80 Z" fill={items.headwear.color.primary} stroke={items.headwear.color.secondary} strokeWidth="1" />
-                  {/* Jewels circles */}
-                  <circle cx="170" cy="58" r="3.5" fill="#EF4444" /> {/* Red ruby */}
-                  <circle cx="200" cy="50" r="3.5" fill="#3B82F6" /> {/* Sapphire */}
-                  <circle cx="230" cy="58" r="3.5" fill="#EF4444" />
-                  {/* Crown ring base */}
-                  <rect x="173" y="76" width="54" height="6" rx="2.2" fill={items.headwear.color.accent} />
-                </>
-              )}
-
-              {/* ATHLETIC HEADBAND */}
-              {items.headwear.style === 'headband' && (
-                <rect x="170" y="70" width="60" height="9" rx="1.5" fill={items.headwear.color.primary} stroke={items.headwear.color.secondary} strokeWidth="1.5" />
-              )}
-            </g>
-          )}
-
-          {/* ===================================================================== */}
-          {/* ACCESSORIES (GLASSES / SATCHEL / SCARF)                              */}
-          {/* ===================================================================== */}
-          {items.accessories.visible && (
-            <g filter="url(#shadow)">
-              {/* GLASSES */}
-              {items.accessories.style === 'glasses' && (
-                <g>
-                  {/* Transparent glass glow filter lenses */}
-                  <circle cx="187" cy="90" r="11" fill="none" stroke={items.accessories.color.primary} strokeWidth="3" />
-                  <circle cx="187" cy="90" r="9" fill="#93C5FD" opacity="0.3" />
-                  
-                  <circle cx="213" cy="90" r="11" fill="none" stroke={items.accessories.color.primary} strokeWidth="3" />
-                  <circle cx="213" cy="90" r="9" fill="#93C5FD" opacity="0.3" />
-
-                  {/* Bridge */}
-                  <line x1="198" y1="90" x2="202" y2="90" stroke={items.accessories.color.primary} strokeWidth="3.5" />
-                  {/* Side ears support */}
-                  <line x1="171" y1="90" x2="176" y2="90" stroke={items.accessories.color.primary} strokeWidth="2.5" />
-                  <line x1="224" y1="90" x2="229" y2="90" stroke={items.accessories.color.primary} strokeWidth="2.5" />
-                </g>
-              )}
-
-              {/* COLLAR SCARF */}
-              {items.accessories.style === 'scarf' && (
-                <g>
-                  {/* Wrapped around the neck */}
-                  <rect x="178" y="112" width="44" height="15" rx="5" fill={items.accessories.color.primary} stroke={items.accessories.color.secondary} strokeWidth="1" />
-                  {/* Hanging tails */}
-                  <path d="M 183 125 C 183 140 178 185 186 195 H 198 C 196 160 195 140 195 125 Z" fill={items.accessories.color.secondary} />
-                  {/* Scarf Fringes details */}
-                  <line x1="186" y1="195" x2="186" y2="202" stroke={items.accessories.color.accent} strokeWidth="2" />
-                  <line x1="190" y1="195" x2="190" y2="202" stroke={items.accessories.color.accent} strokeWidth="2" />
-                  <line x1="194" y1="195" x2="194" y2="202" stroke={items.accessories.color.accent} strokeWidth="2" />
-                </g>
-              )}
-
-              {/* GOLD PENDANT NECKLACE */}
-              {items.accessories.style === 'necklace' && (
-                <g>
-                  {/* Chain curve */}
-                  <path d="M 188 120 C 188 144 212 144 212 120" fill="none" stroke={items.accessories.color.primary} strokeWidth="2" />
-                  {/* Star / Heart charm jewel pendant link */}
-                  <polygon points="200,136 203,142 209,142 204,146 206,152 200,148 194,152 196,146 191,142 197,142" fill={items.accessories.color.secondary} stroke={items.accessories.color.accent} strokeWidth="1" />
-                </g>
-              )}
-
-              {/* SATCHEL BAG (Cross-body) */}
-              {items.accessories.style === 'satchel' && (
-                <g>
-                  {/* Diagonal shoulder strap */}
-                  <path d="M 152 135 L 235 210 L 243 205 L 160 130 Z" fill={items.accessories.color.secondary} opacity="0.9" />
-                  {/* Circular Bag pouch resting on the hip */}
-                  <rect x="222" y="195" width="28" height="22" rx="4" fill={items.accessories.color.primary} />
-                  {/* Lock metal badge */}
-                  <circle cx="236" cy="208" r="3" fill={items.accessories.color.accent} />
-                </g>
-              )}
-            </g>
-          )}
-
-        </g>
-      </svg>
+    <div className="relative w-full h-[520px] rounded-2xl bg-gradient-to-b from-slate-900 to-[#1e293b] flex items-center justify-center shadow-2xl border border-slate-800 overflow-hidden">
+      {/* Background spot ambiance light flare */}
+      <div className="absolute inset-x-0 top-1/4 h-2/3 bg-[radial-gradient(circle_at_center,rgba(99,102,241,0.14)_0%,transparent_70%)] pointer-events-none" />
+      
+      {/* Background technical alignment line grid */}
+      <div className="absolute inset-0 bg-[linear-gradient(to_right,#33415518_1px,transparent_1px),linear-gradient(to_bottom,#33415518_1px,transparent_1px)] bg-[size:16px_16px] pointer-events-none" />
+
+      {/* Primary WebGL canvas container mounting zone */}
+      <div ref={containerRef} className="w-full h-full cursor-grab active:cursor-grabbing" />
+
+      {/* Realistic interactive UI HUD overlay controls */}
+      <div className="absolute top-4 left-4 flex flex-col gap-2 pointer-events-none">
+        <span className="inline-flex items-center gap-1.5 px-3 py-1.2 rounded-full border border-slate-800 bg-slate-950/80 backdrop-blur-md text-[10px] uppercase tracking-wider font-semibold text-indigo-300 shadow-md">
+          <Move3d className="h-3 w-3 animate-pulse" />
+          Interactive 3D Mannequin
+        </span>
+      </div>
+
+      {/* Rotating control triggers on bottom panel */}
+      <div className="absolute bottom-4 right-4 flex items-center gap-2">
+        <button
+          onClick={() => setAutoRotate(!autoRotate)}
+          className={`cursor-pointer inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl border text-[11px] font-medium tracking-wide transition-all shadow-md ${
+            autoRotate
+              ? 'border-indigo-500 bg-indigo-950/90 text-indigo-200'
+              : 'border-slate-800 bg-slate-950/90 text-slate-400 hover:text-slate-200'
+          }`}
+          title={autoRotate ? 'Pause Auto-Rotation' : 'Unpause Auto-Rotation'}
+        >
+          <RotateCw className={`h-3.5 w-3.5 ${autoRotate ? 'animate-spin' : ''}`} style={{ animationDuration: '8s' }} />
+          <span>{autoRotate ? 'Auto Spinning' : 'Stationary'}</span>
+        </button>
+
+        <div className="flex h-8 px-2.5 items-center bg-slate-950/80 border border-slate-800 text-slate-500 rounded-xl text-[10px] gap-1 shadow-md">
+          <Compass className="h-3.5 w-3.5 text-slate-400" />
+          <span>Drag 360°</span>
+        </div>
+      </div>
     </div>
   );
 };
