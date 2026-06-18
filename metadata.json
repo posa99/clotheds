@@ -2,5 +2,5 @@
   "name": "Customizable Clothes System",
   "description": "An interactive playground to design, style, and customize clothing items on an adjustable mannequin with real-time color, pattern, and layer selections.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": []
 }
