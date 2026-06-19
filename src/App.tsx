@@ -510,30 +510,30 @@ export default function App() {
     triggerToast('Outfit JSON blueprint copied to clipboard!', 'success');
   };
 
-  // Triggering local dynamic download as a beautiful high definition SVG!
-  const handleDownloadSVG = () => {
-    const svgEl = document.getElementById('mannequin-canvas');
-    if (!svgEl) {
+  // Triggering local dynamic download as a beautiful high-resolution PNG!
+  const handleDownloadPNG = () => {
+    const canvasEl = document.getElementById('mannequin-canvas') as HTMLCanvasElement | null;
+    if (!canvasEl) {
       triggerToast('Unable to locate mannequin canvas.', 'error');
       return;
     }
 
-    // Capture exact HTML string
-    const serializer = new XMLSerializer();
-    const svgStr = serializer.serializeToString(svgEl);
+    try {
+      // Capture the canvas drawing buffer as a beautiful transparent PNG image
+      const dataUrl = canvasEl.toDataURL('image/png');
+      
+      const link = document.createElement('a');
+      link.href = dataUrl;
+      link.download = `custom-attire-${Date.now()}.png`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
 
-    // Write file attachment trigger
-    const blob = new Blob([svgStr], { type: 'image/svg+xml;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `custom-attire-${Date.now()}.svg`;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-
-    triggerToast('Downloaded Vector SVG avatar file!', 'success');
+      triggerToast('Downloaded custom outfit image PNG!', 'success');
+    } catch (e) {
+      console.error('Export failed:', e);
+      triggerToast('Failed to export canvas image.', 'error');
+    }
   };
 
   // Import code handler (prompts user with dialog input for their JSON outfit)
@@ -610,11 +610,11 @@ export default function App() {
               <Copy className="h-3.5 w-3.5" /> Share JSON
             </button>
             <button
-              onClick={handleDownloadSVG}
+              onClick={handleDownloadPNG}
               className="px-3.5 py-2 text-xs font-semibold bg-indigo-600 text-white rounded-xl shadow-md hover:bg-indigo-700 transition flex items-center gap-1.5 cursor-pointer"
-              title="Download compiled raw SVG"
+              title="Download mannequin render as PNG"
             >
-              <Download className="h-3.5 w-3.5" /> Export Vector SVG
+              <Download className="h-3.5 w-3.5" /> Export PNG Image
             </button>
           </div>
         </header>

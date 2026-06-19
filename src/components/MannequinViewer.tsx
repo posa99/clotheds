@@ -178,8 +178,13 @@ export const MannequinViewer: React.FC<MannequinViewerProps> = ({
     camera.position.set(0, 0.4, 4.8);
     cameraRef.current = camera;
 
-    // WebGL Renderer
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    // WebGL Renderer with drawing buffer preservation for high quality image export
+    const renderer = new THREE.WebGLRenderer({ 
+      antialias: true, 
+      alpha: true, 
+      preserveDrawingBuffer: true 
+    });
+    renderer.domElement.id = 'mannequin-canvas';
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setSize(containerRef.current.clientWidth, containerRef.current.clientHeight);
     renderer.shadowMap.enabled = true;
